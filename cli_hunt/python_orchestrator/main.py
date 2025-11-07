@@ -220,7 +220,7 @@ def fetcher_worker(db_manager, stop_event, tui_app):
                     if db_manager.add_challenge(address, deepcopy(new_challenge)):
                         tui_app.post_message(
                             LogMessage(
-                                f"New challenge {new_challenge['challengeId']} added for {address[:10]}..."
+                                f"New challenge {new_challenge['challengeId']} added for {addr[:6]}...{addr[-4:]}..."
                             )
                         )
                         added = True
@@ -243,7 +243,7 @@ def fetcher_worker(db_manager, stop_event, tui_app):
 def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
     """Solves a single challenge."""
     c = challenge  # for brevity
-    msg = f"Attempting to solve challenge {c['challengeId']} for {address[:10]}..."
+    msg = f"Attempting to solve challenge {c['challengeId']} for {addr[:6]}...{addr[-4:]}..."
     tui_app.post_message(LogMessage(msg))
 
     try:
@@ -421,7 +421,7 @@ def solver_worker(db_manager, stop_event, solve_interval, tui_app, max_solvers):
                                     address, c["challengeId"], {"status": "expired"}
                                 )
                                 if updated_status:
-                                    msg = f"Challenge {c['challengeId']} for {address[:10]}... has expired."
+                                    msg = f"Challenge {c['challengeId']} for {addr[:6]}...{addr[-4:]}... has expired."
                                     tui_app.post_message(LogMessage(msg))
                                     tui_app.post_message(
                                         ChallengeUpdate(
