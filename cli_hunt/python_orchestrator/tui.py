@@ -59,6 +59,50 @@ class SolutionFound(Message):
     pass
 
 
+class RetryQueued(Message):
+    def __init__(self, address: str, challenge_id: str, attempt_count: int) -> None:
+        self.address = address
+        self.challenge_id = challenge_id
+        self.attempt_count = attempt_count
+        super().__init__()
+
+
+class RetryAttempting(Message):
+    def __init__(
+        self, address: str, challenge_id: str, attempt_count: int, next_delay: float
+    ) -> None:
+        self.address = address
+        self.challenge_id = challenge_id
+        self.attempt_count = attempt_count
+        self.next_delay = next_delay
+        super().__init__()
+
+
+class RetrySuccess(Message):
+    def __init__(
+        self, address: str, challenge_id: str, total_attempts: int
+    ) -> None:
+        self.address = address
+        self.challenge_id = challenge_id
+        self.total_attempts = total_attempts
+        super().__init__()
+
+
+class RetryFailed(Message):
+    def __init__(self, address: str, challenge_id: str, final_error: str) -> None:
+        self.address = address
+        self.challenge_id = challenge_id
+        self.final_error = final_error
+        super().__init__()
+
+
+class RetryExpired(Message):
+    def __init__(self, address: str, challenge_id: str) -> None:
+        self.address = address
+        self.challenge_id = challenge_id
+        super().__init__()
+
+
 class SolutionsTracker:
     """Thread-safe counter for solutions in the last rolling hour."""
 
@@ -95,22 +139,28 @@ class OrchestratorTUI(App):
     TITLE = "Midnight Scavenger Hunt Orchestrator"
 
     def __init__(
-        self, db_manager, worker_functions: dict, worker_args: dict, *args, **kwargs
+        self,
+        db_manager,
+        retry_manager,
+        worker_functions: dict,
+        worker_args: dict,
+        *args,
+        **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.db_manager = db_manager
+        self.retry_manager = retry_manager
         self.worker_functions = worker_functions
         self.worker_args = worker_args
         self.stop_event = threading.Event()
-        self.solutions_tracker = SolutionsTracker()  # Initialize here
+        self.solutions_tracker = SolutionsTracker()
 
-        # Internal state for the table
         self._addresses = []
-        self._challenge_ids = OrderedDict()  # challenge_id -> short_id
+        self._challenge_ids = OrderedDict()
         self._all_receipts = {}
-        self._total_receipts = 0  # address -> receipts
+        self._total_receipts = 0
         self._all_night = {}
-        self._total_night = 0.0  # address -> night
+        self._total_night = 0.0
 
     def compose(self) -> ComposeResult:
         """Create child widgets for the app."""
@@ -155,6 +205,7 @@ class OrchestratorTUI(App):
         self.run_solver_worker()
         self.run_saver_worker()
         self.run_stats_worker()
+        self.run_retry_worker()
 
     def _get_status_display(self, status: str) -> str:
         """Return a user-friendly (emoji) string for a status."""
@@ -163,6 +214,8 @@ class OrchestratorTUI(App):
             "solving": "⚙️ Solving",
             "solved": "✅ Solved",
             "validated": "🏆 Validated",
+            "retrying": "🔄 Retry",
+            "submission_failed": "💀 Failed",
             "expired": "❌ Expired",
             "submission_error": "❗️ Error",
         }
@@ -321,15 +374,30 @@ class OrchestratorTUI(App):
                 )
             )
 
+    def on_retry_queued(self, message: RetryQueued) -> None:
+        pass
+
+    def on_retry_attempting(self, message: RetryAttempting) -> None:
+        pass
+
+    def on_retry_success(self, message: RetrySuccess) -> None:
+        pass
+
+    def on_retry_failed(self, message: RetryFailed) -> None:
+        pass
+
+    def on_retry_expired(self, message: RetryExpired) -> None:
+        pass
+
     # --- Actions ---
 
     def action_quit(self) -> None:
         """Action to quit the application, triggered by Ctrl+C."""
         self.log_widget.write_line("Shutdown signal received. Stopping threads...")
         self.stop_event.set()
-        # Give workers a moment to notice the event. A proper implementation would join them.
         self.log_widget.write_line("Performing final save...")
         self.db_manager.save_to_disk()
+        self.retry_manager.save_snapshot()
         self.log_widget.write_line("Exiting.")
         self.exit()
 
@@ -350,6 +418,7 @@ class OrchestratorTUI(App):
         challenge_selection = self.worker_args["challenge_selection"]
         solver_func(
             self.db_manager,
+            self.retry_manager,
             self.stop_event,
             solve_interval,
             self,
@@ -362,7 +431,13 @@ class OrchestratorTUI(App):
         """Runs the database saver logic in a background thread."""
         saver_func = self.worker_functions["saver"]
         interval = self.worker_args["save_interval"]
-        saver_func(self.db_manager, self.stop_event, interval, self)
+        saver_func(self.db_manager, self.retry_manager, self.stop_event, interval, self)
+
+    @work(name="retry", group="workers", thread=True)
+    def run_retry_worker(self) -> None:
+        """Runs the retry logic in a background thread."""
+        retry_func = self.worker_functions["retry"]
+        retry_func(self.db_manager, self.retry_manager, self.stop_event, self)
 
     @work(name="stats", group="workers", thread=True)
     def run_stats_worker(self) -> None:
