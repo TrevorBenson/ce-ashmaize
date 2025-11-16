@@ -1,8 +1,10 @@
-use ashmaize::{hash, Rom, RomGenerationType};
+// use ashmaize::{hash, Rom, RomGenerationType};
+use ashmaize::b2::hash; // Use the blake2 implementation (slightly faster)
+use ashmaize::{Rom, RomGenerationType};
 use clap::Parser;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const NUM_THREADS: u64 = 2;
 pub const MB: usize = 1024 * 1024;

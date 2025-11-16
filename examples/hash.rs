@@ -1,6 +1,7 @@
 use std::sync::mpsc::{Sender, channel};
 use std::{sync::Arc, thread, time::SystemTime};
 
+use ashmaize::original::hash;
 use ashmaize::*;
 use indicatif::{ProgressBar, ProgressStyle};
 

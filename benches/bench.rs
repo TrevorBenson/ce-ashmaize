@@ -1,27 +1,27 @@
-use ashmaize::{Rom, RomGenerationType};
+use ashmaize::rom::{Rom, RomGenerationType};
 use criterion::{Criterion, criterion_group, criterion_main};
-use randomx_rs::{RandomXCache, RandomXFlag, RandomXVM};
 
 fn criterion_benchmark(c: &mut Criterion) {
     const GB: usize = 1_024 * 1_024 * 1_024;
     const MB: usize = 1_024 * 1_024;
 
     // ashmaize/initialize is taking a long time, so set the sample size to the minimum
-    let mut group = c.benchmark_group("ashmaize");
-    group.sample_size(10);
-    group.bench_function("initialize", |b| {
-        b.iter(|| {
-            Rom::new(
-                b"password",
-                RomGenerationType::TwoStep {
-                    pre_size: 16 * MB,
-                    mixing_numbers: 4,
-                },
-                2 * GB,
-            )
-        })
-    });
-    group.finish();
+    // Rom::new takes 1.5s
+    // let mut group = c.benchmark_group("ashmaize");
+    // group.sample_size(10);
+    // group.bench_function("Rom::new", |b| {
+    //     b.iter(|| {
+    //         Rom::new(
+    //             b"password",
+    //             RomGenerationType::TwoStep {
+    //                 pre_size: 16 * MB,
+    //                 mixing_numbers: 4,
+    //             },
+    //             1 * GB,
+    //         )
+    //     })
+    // });
+    // group.finish();
 
     let rom = Rom::new(
         b"password",
@@ -29,38 +29,79 @@ fn criterion_benchmark(c: &mut Criterion) {
             pre_size: 16 * MB,
             mixing_numbers: 4,
         },
-        2 * GB,
+        1 * GB,
     );
-    c.bench_function("ashmaize/hash-1", |b| {
-        b.iter(|| ashmaize::hash(b"salt", &rom, 8, 256))
-    });
-    c.bench_function("ashmaize/hash-2", |b| {
-        b.iter(|| ashmaize::hash(b"salt2", &rom, 8, 256))
-    });
-    c.bench_function("ashmaize/hash-3", |b| {
-        b.iter(|| ashmaize::hash(b"salt3", &rom, 8, 256))
-    });
-    c.bench_function("ashmaize/hash-4", |b| {
-        b.iter(|| ashmaize::hash(b"salt4", &rom, 8, 256))
+
+    // hash takes 720 us
+    c.bench_function("original::hash", |b| {
+        b.iter(|| ashmaize::original::hash(b"salt", &rom, 8, 256))
     });
 
-    c.bench_function("RandomX/initialize", |b| {
+    // blake2 crate hash slightly faster than cryptoxide
+    c.bench_function("b2::hash", |b| {
+        b.iter(|| ashmaize::b2::hash(b"salt", &rom, 8, 256))
+    });
+
+    // simd hash same speed as cryptoxide one
+    c.bench_function("simd::hash", |b| {
+        b.iter(|| ashmaize::simd::hash(b"salt", &rom, 8, 256))
+    });
+
+    // VM::new takes 2 us
+    c.bench_function("VM::new", |b| {
+        b.iter(|| ashmaize::original::VM::new(&rom.digest, 256, b"salt"))
+    });
+
+    // VM::execute takes 100 us (and is executed 8 times) is CLEARLY the thing to optimize
+    // VM::finalize takes 1 us
+    let mut vm = ashmaize::original::VM::new(&rom.digest, 256, b"salt");
+    c.bench_function("VM::execute", |b| b.iter(|| vm.execute(&rom, 256)));
+    c.bench_function("VM::finalize", |b| b.iter(|| vm.clone().finalize()));
+
+    // Look at inside the VM::execute function.
+    // It seems that all three of shuffle / step / post_instructions
+    // would be worth optimizing equally.
+    //
+    // program.shuffle takes 20 us
+    let mut vm1 = ashmaize::original::VM::new(&rom.digest, 256, b"salt");
+    c.bench_function("program.shuffle", |b| {
+        b.iter(|| vm1.program.shuffle(&vm1.prog_seed))
+    });
+
+    // VM.step (x256) takes 27 us
+    let mut vm2 = ashmaize::original::VM::new(&rom.digest, 256, b"salt");
+    vm2.program.shuffle(&vm2.prog_seed);
+    c.bench_function("VM.step (x256)", |b| {
         b.iter(|| {
-            RandomXVM::new(
-                RandomXFlag::FLAG_DEFAULT,
-                Some(RandomXCache::new(RandomXFlag::FLAG_DEFAULT, b"key").unwrap()),
-                None,
-            )
+            for _ in 0..256 {
+                vm2.step(&rom)
+            }
         })
     });
 
-    let vm = RandomXVM::new(
-        RandomXFlag::FLAG_DEFAULT,
-        Some(RandomXCache::new(RandomXFlag::FLAG_DEFAULT, b"key").unwrap()),
-        None,
-    )
-    .unwrap();
-    c.bench_function("RandomX/hash", |b| b.iter(|| vm.calculate_hash(b"data")));
+    // VM.post_instructions takes 35 us
+    let mut vm3 = ashmaize::original::VM::new(&rom.digest, 256, b"salt");
+    c.bench_function("VM.post_instructions", |b| {
+        b.iter(|| vm3.post_instructions())
+    });
+
+    // c.bench_function("RandomX/initialize", |b| {
+    //     b.iter(|| {
+    //         RandomXVM::new(
+    //             RandomXFlag::FLAG_DEFAULT,
+    //             Some(RandomXCache::new(RandomXFlag::FLAG_DEFAULT, b"key").unwrap()),
+    //             None,
+    //         )
+    //     })
+    // });
+
+    // let vm = RandomXVM::new(
+    //     RandomXFlag::FLAG_DEFAULT,
+    //     Some(RandomXCache::new(RandomXFlag::FLAG_DEFAULT, b"key").unwrap()),
+    //     None,
+    // )
+    // .unwrap();
+    // c.bench_function("RandomX/hash", |b| b.iter(|| vm.calculate_hash(b"data")));
 }
 
 criterion_group!(benches, criterion_benchmark);

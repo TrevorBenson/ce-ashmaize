@@ -55,7 +55,7 @@ impl Rom {
     /// Compute the digest
     #[wasm_bindgen]
     pub fn hash(&self, salt: &[u8], nb_loops: u32, nb_instrs: u32) -> Vec<u8> {
-        ashmaize::hash(salt, &self.0, nb_loops, nb_instrs).to_vec()
+        ashmaize::original::hash(salt, &self.0, nb_loops, nb_instrs).to_vec()
     }
 }
 

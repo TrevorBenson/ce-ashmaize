@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use ashmaize::{Rom, RomGenerationType, hash};
+use ashmaize::original::hash;
+use ashmaize::{Rom, RomGenerationType};
 use leptos::{prelude::*, task::spawn_local};
 
 fn leading_zeros(digest: &[u8; 64], expected: u32) -> bool {

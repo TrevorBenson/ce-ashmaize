@@ -5,7 +5,7 @@ use cryptoxide::{
 
 pub const DATASET_ACCESS_SIZE: usize = 64;
 
-pub(crate) struct RomDigest(pub(crate) [u8; 64]);
+pub struct RomDigest(pub(crate) [u8; 64]);
 
 /// The **R**ead **O**only **M**emory used to generate the proram.
 ///
@@ -15,7 +15,7 @@ pub(crate) struct RomDigest(pub(crate) [u8; 64]);
 ///
 /// [`hash`]: crate::hash
 pub struct Rom {
-    pub(crate) digest: RomDigest,
+    pub digest: RomDigest,
     data: Vec<u8>,
 }
 
