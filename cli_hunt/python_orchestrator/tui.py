@@ -153,14 +153,15 @@ class OrchestratorTUI(App):
         self.worker_functions = worker_functions
         self.worker_args = worker_args
         self.stop_event = threading.Event()
-        self.solutions_tracker = SolutionsTracker()
+        self.solutions_tracker = SolutionsTracker()  # Initialize here
 
+        # Internal state for the table
         self._addresses = []
-        self._challenge_ids = OrderedDict()
+        self._challenge_ids = OrderedDict()  # challenge_id -> short_id
         self._all_receipts = {}
-        self._total_receipts = 0
+        self._total_receipts = 0  # address -> receipts
         self._all_night = {}
-        self._total_night = 0.0
+        self._total_night = 0.0  # address -> night
 
     def compose(self) -> ComposeResult:
         """Create child widgets for the app."""
@@ -393,8 +394,10 @@ class OrchestratorTUI(App):
 
     def action_quit(self) -> None:
         """Action to quit the application, triggered by Ctrl+C."""
+        # Give workers a moment to notice the event. A proper implementation would join them.
         self.log_widget.write_line("Shutdown signal received. Stopping threads...")
         self.stop_event.set()
+        # Give workers a moment to notice the event. A proper implementation would join them.
         self.log_widget.write_line("Performing final save...")
         self.db_manager.save_to_disk()
         self.retry_manager.save_snapshot()
