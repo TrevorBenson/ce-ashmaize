@@ -560,7 +560,7 @@ def _solve_one_challenge(
     db_manager, retry_manager, tui_app, stop_event, address, challenge
 ):
     """Solves a single challenge."""
-    c = challenge
+    c = challenge  # for brevity
     short_address = f"{address[:10]}…{address[-6:]}"
     msg = f"Attempting to solve challenge {c['challengeId']} for {short_address}"
     tui_app.post_message(LogMessage(msg))
@@ -702,9 +702,10 @@ def _solve_one_challenge(
     except subprocess.CalledProcessError as e:
         msg = f"Rust solver error for {c['challengeId']}: {e.stderr.strip()}"
         tui_app.post_message(LogMessage(msg))
+        # Revert status to available if solver fails
         db_manager.update_challenge(address, c["challengeId"], {"status": "available"})
         tui_app.post_message(ChallengeUpdate(address, c["challengeId"], "available"))
-    except requests.exceptions.RequestException as e:
+    except requests.exceptions.RequestException as e:  # ty: ignore
         if should_retry_error(e):
             now = datetime.now(timezone.utc)
             retry_item = SubmissionRetryItem(
@@ -857,7 +858,7 @@ def solver_worker(
                                 tui_app,
                                 stop_event,
                                 address,
-                                deepcopy(c),
+                                deepcopy(c),  # Pass a deepcopy
                             )
                             active_futures.add(future)
                             challenges_dispatched_this_round += 1
