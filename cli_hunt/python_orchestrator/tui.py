@@ -13,10 +13,10 @@ from textual.widgets import DataTable, Footer, Header, Log, Static
 
 
 class LogMessage(Message):
-    """Message to add a line to the TUI log viewer."""
+    """Message to add line(s) to the TUI log viewer."""
 
-    def __init__(self, message: str) -> None:
-        self.message = message
+    def __init__(self, message: str | list[str]) -> None:
+        self.message = message if isinstance(message, list) else [message]
         super().__init__()
 
 
@@ -295,10 +295,11 @@ class OrchestratorTUI(App):
     # --- Message Handlers ---
 
     def on_log_message(self, message: LogMessage) -> None:
-        """Display a log message from a worker."""
+        """Display log message(s) from a worker."""
         now = datetime.now().strftime("%H:%M:%S")
-        self.log_widget.write_line(f"[{now}] {message.message}")
-        logging.info(message.message)  # Also write to the actual log file
+        for line in message.message:
+            self.log_widget.write_line(f"[{now}] {line}")
+            logging.info(line)  # Also write to the actual log file
 
     def on_challenge_update(self, message: ChallengeUpdate) -> None:
         """Update a single cell in the DataTable, if the challenge is currently displayed."""
@@ -360,13 +361,11 @@ class OrchestratorTUI(App):
 
         if hour_rolled:
             # The hour just finished – report the total for the *previous* hour
-            self.post_message(
-                LogMessage("-----------------------------------------------")
-            )
-            self.post_message(LogMessage(f"Total solutions past hour: {count}"))
-            self.post_message(
-                LogMessage("-----------------------------------------------")
-            )
+            self.post_message(LogMessage([
+                "-----------------------------------------------",
+                f"Total solutions past hour: {count}",
+                "-----------------------------------------------",
+            ]))
         else:
             elapsed_minutes = elapsed.total_seconds() / 60
             self.post_message(
@@ -440,7 +439,12 @@ class OrchestratorTUI(App):
     def run_retry_worker(self) -> None:
         """Runs the retry logic in a background thread."""
         retry_func = self.worker_functions["retry"]
-        retry_func(self.db_manager, self.retry_manager, self.stop_event, self)
+        session = self.worker_args["session"]
+        retry_config = self.worker_args["retry_config"]
+        retry_func(
+            self.db_manager, self.retry_manager, self.stop_event,
+            self, session, retry_config
+        )
 
     @work(name="stats", group="workers", thread=True)
     def run_stats_worker(self) -> None:
