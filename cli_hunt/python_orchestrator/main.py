@@ -2,16 +2,16 @@ import argparse
 import json
 import logging
 import os
-import queue
-import time
 import concurrent.futures
 import subprocess
 import threading
 from copy import deepcopy
-from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 
 from curl_cffi import requests
+from journal import Journal
+from retry import SubmissionRetryManager, SubmissionRetryItem, retry_worker
+from submission import submit_solution
 from tui import (
     ChallengeUpdate,
     SolutionFound,
@@ -19,10 +19,6 @@ from tui import (
     OrchestratorTUI,
     RefreshTable,
     RetryQueued,
-    RetryAttempting,
-    RetrySuccess,
-    RetryFailed,
-    RetryExpired,
     StatsUpdate,
 )
 
@@ -44,10 +40,6 @@ RETRY_INITIAL_DELAY = 5
 RETRY_MAX_DELAY = 300
 RETRY_MAX_ATTEMPTS = 10
 RETRY_BACKOFF_MULTIPLIER = 2.0
-
-
-# --- HTTP Session Setup ---
-session = requests.Session()
 
 # --- HTTP Session Setup ---
 # Using curl_cffi to impersonate a browser's TLS fingerprint. This is more
@@ -94,43 +86,6 @@ def fetch_wallet_statistics(address):
         return (0, 0)
 
 
-@dataclass
-class SubmissionRetryItem:
-    address: str
-    challenge_id: str
-    nonce: str
-    challenge_data: dict
-    attempt_count: int
-    next_retry_time: datetime
-    first_attempt_time: datetime
-    last_error: str
-
-    def __lt__(self, other):
-        return self.next_retry_time < other.next_retry_time
-
-
-def should_retry_error(error: requests.exceptions.RequestException) -> bool:
-    if isinstance(error, requests.exceptions.Timeout):
-        return True
-
-    if isinstance(error, requests.exceptions.ConnectionError):
-        return True
-
-    if hasattr(error, "response") and error.response is not None:
-        status_code = error.response.status_code
-
-        if 500 <= status_code < 600:
-            return True
-
-        if status_code == 429:
-            return True
-
-        if 400 <= status_code < 500:
-            return False
-
-    return False
-
-
 # --- DatabaseManager for Thread-Safe Operations ---
 class DatabaseManager:
     """Manages the in-memory database with thread-safe operations and journaling."""
@@ -139,6 +94,7 @@ class DatabaseManager:
         self._db = {}
         # A lock is still good practice for data consistency between background workers.
         self._lock = threading.Lock()
+        self._journal = Journal(JOURNAL_FILE)
         self._load_from_disk()
         self._replay_journal()
         self._reset_solving_challenges_on_startup()
@@ -146,7 +102,7 @@ class DatabaseManager:
     def _load_from_disk(self):
         if os.path.exists(DB_FILE):
             try:
-                with open(DB_FILE, "r") as f:
+                with open(DB_FILE, "r", encoding='utf8') as f:
                     self._db = json.load(f)
                 logging.info("Loaded main database from challenges.json.")
             except json.JSONDecodeError:
@@ -171,28 +127,16 @@ class DatabaseManager:
                     break
 
     def _replay_journal(self):
-        if not os.path.exists(JOURNAL_FILE):
-            return
+        def handler(action, payload):
+            address = payload.get("address")
+            if action == "add_challenge":
+                self._apply_add_challenge(address, payload["challenge"])
+            elif action == "update_challenge":
+                self._apply_update_challenge(
+                    address, payload["challengeId"], payload["update"]
+                )
 
-        logging.info("Replaying journal...")
-        replayed_count = 0
-        with open(JOURNAL_FILE, "r") as f:
-            for line in f:
-                try:
-                    log_entry = json.loads(line)
-                    action = log_entry.get("action")
-                    payload = log_entry.get("payload")
-                    address = payload.get("address")
-
-                    if action == "add_challenge":
-                        self._apply_add_challenge(address, payload["challenge"])
-                    elif action == "update_challenge":
-                        self._apply_update_challenge(
-                            address, payload["challengeId"], payload["update"]
-                        )
-                    replayed_count += 1
-                except (json.JSONDecodeError, KeyError):
-                    logging.warning(f"Skipping malformed journal entry: {line.strip()}")
+        replayed_count = self._journal.replay(handler)
         if replayed_count > 0:
             logging.info(f"Replayed {replayed_count} journal entries.")
 
@@ -210,25 +154,13 @@ class DatabaseManager:
                 f"Reset {reset_count} challenges from 'solving' to 'available' status on startup."
             )
 
-    def _log_to_journal(self, action, payload):
-        try:
-            with open(JOURNAL_FILE, "a") as f:
-                log_entry = {
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "action": action,
-                    "payload": payload,
-                }
-                f.write(json.dumps(log_entry) + "\n")
-        except IOError as e:
-            logging.critical(f"CRITICAL: Could not write to journal file: {e}")
-
     def add_challenge(self, address, challenge):
         with self._lock:
             queue = self._db.get(address, {}).get("challenge_queue", [])
             if any(c["challengeId"] == challenge["challengeId"] for c in queue):
                 return False
 
-            self._log_to_journal(
+            self._journal.append(
                 "add_challenge", {"address": address, "challenge": challenge}
             )
             self._apply_add_challenge(address, challenge)
@@ -236,7 +168,7 @@ class DatabaseManager:
 
     def update_challenge(self, address, challenge_id, update):
         with self._lock:
-            self._log_to_journal(
+            self._journal.append(
                 "update_challenge",
                 {"address": address, "challengeId": challenge_id, "update": update},
             )
@@ -283,217 +215,12 @@ class DatabaseManager:
         logging.info("Saving database to disk...")
         with self._lock:
             try:
-                with open(DB_FILE, "w") as f:
+                with open(DB_FILE, "w", encoding='utf8') as f:
                     json.dump(self._db, f, indent=2)
-                if os.path.exists(JOURNAL_FILE):
-                    open(JOURNAL_FILE, "w").close()
+                self._journal.clear()
                 logging.info("Database saved successfully.")
             except IOError as e:
                 logging.error(f"Error saving database: {e}")
-
-
-class SubmissionRetryManager:
-    def __init__(self, db_manager):
-        self._queue = queue.PriorityQueue()
-        self._lock = threading.Lock()
-        self._active_retries = {}
-        self._db_manager = db_manager
-        self._stats = {
-            "total_queued": 0,
-            "total_success": 0,
-            "total_failed": 0,
-            "total_expired": 0,
-        }
-        self._load_from_journal()
-
-    def _load_from_journal(self):
-        if not os.path.exists(RETRY_JOURNAL_FILE):
-            return
-
-        logging.info("Replaying retry queue journal...")
-        retry_items = {}
-
-        try:
-            with open(RETRY_JOURNAL_FILE, "r") as f:
-                for line in f:
-                    try:
-                        entry = json.loads(line)
-                        action = entry["action"]
-                        payload = entry["payload"]
-                        challenge_id = payload["challenge_id"]
-
-                        if action == "add_retry":
-                            retry_items[challenge_id] = payload
-                        elif action == "retry_attempt":
-                            if challenge_id in retry_items:
-                                retry_items[challenge_id].update(payload)
-                        elif action in ["retry_success", "retry_failed", "retry_expired"]:
-                            retry_items.pop(challenge_id, None)
-                    except (json.JSONDecodeError, KeyError) as e:
-                        logging.warning(f"Skipping malformed retry journal entry: {e}")
-        except IOError as e:
-            logging.error(f"Error reading retry journal: {e}")
-            return
-
-        now = datetime.now(timezone.utc)
-        recovered = 0
-        expired = 0
-
-        for challenge_id, item_data in retry_items.items():
-            try:
-                latest_submission = datetime.fromisoformat(
-                    item_data["challenge_data"]["latestSubmission"].replace("Z", "+00:00")
-                )
-
-                if now > latest_submission:
-                    expired += 1
-                    logging.info(f"Discarding expired retry item for {challenge_id}")
-                    self._db_manager.update_challenge(
-                        item_data["address"], challenge_id, {"status": "expired"}
-                    )
-                    continue
-
-                retry_item = SubmissionRetryItem(
-                    address=item_data["address"],
-                    challenge_id=challenge_id,
-                    nonce=item_data["nonce"],
-                    challenge_data=item_data["challenge_data"],
-                    attempt_count=item_data["attempt_count"],
-                    next_retry_time=datetime.fromisoformat(item_data["next_retry_time"]),
-                    first_attempt_time=datetime.fromisoformat(item_data["first_attempt_time"]),
-                    last_error=item_data["last_error"],
-                )
-
-                if retry_item.next_retry_time < now:
-                    retry_item.next_retry_time = now
-
-                self._queue.put((retry_item.next_retry_time, retry_item))
-                self._active_retries[challenge_id] = retry_item
-                recovered += 1
-            except (KeyError, ValueError) as e:
-                logging.warning(f"Error recovering retry item {challenge_id}: {e}")
-
-        if recovered > 0 or expired > 0:
-            logging.info(f"Recovered {recovered} retry items from journal ({expired} expired)")
-
-    def _log_to_journal(self, action: str, payload: dict):
-        try:
-            with open(RETRY_JOURNAL_FILE, "a") as f:
-                entry = {
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "action": action,
-                    "payload": payload,
-                }
-                f.write(json.dumps(entry) + "\n")
-        except IOError as e:
-            logging.error(f"Failed to write to retry journal: {e}")
-
-    def add_retry(self, item: SubmissionRetryItem) -> bool:
-        with self._lock:
-            if item.challenge_id in self._active_retries:
-                return False
-
-            self._log_to_journal(
-                "add_retry",
-                {
-                    "address": item.address,
-                    "challenge_id": item.challenge_id,
-                    "nonce": item.nonce,
-                    "challenge_data": item.challenge_data,
-                    "attempt_count": item.attempt_count,
-                    "next_retry_time": item.next_retry_time.isoformat(),
-                    "first_attempt_time": item.first_attempt_time.isoformat(),
-                    "last_error": item.last_error,
-                },
-            )
-
-            self._queue.put((item.next_retry_time, item))
-            self._active_retries[item.challenge_id] = item
-            self._stats["total_queued"] += 1
-            return True
-
-    def get_next_ready_retry(self, timeout=1.0):
-        try:
-            next_retry_time, item = self._queue.get(timeout=timeout)
-            now = datetime.now(timezone.utc)
-
-            if next_retry_time > now:
-                wait_seconds = (next_retry_time - now).total_seconds()
-                sleep_duration = min(wait_seconds, timeout)
-
-                self._queue.put((next_retry_time, item))
-
-                time.sleep(sleep_duration)
-                return None
-
-            return item
-        except queue.Empty:
-            return None
-
-    def update_retry_attempt(self, item: SubmissionRetryItem):
-        with self._lock:
-            self._log_to_journal(
-                "retry_attempt",
-                {
-                    "challenge_id": item.challenge_id,
-                    "attempt_count": item.attempt_count,
-                    "next_retry_time": item.next_retry_time.isoformat(),
-                    "last_error": item.last_error,
-                },
-            )
-            self._active_retries[item.challenge_id] = item
-
-    def remove_retry(self, challenge_id: str, reason: str):
-        with self._lock:
-            self._active_retries.pop(challenge_id, None)
-            self._log_to_journal(f"retry_{reason}", {"challenge_id": challenge_id})
-
-            if reason == "success":
-                self._stats["total_success"] += 1
-            elif reason == "failed":
-                self._stats["total_failed"] += 1
-            elif reason == "expired":
-                self._stats["total_expired"] += 1
-
-    def get_stats(self) -> dict:
-        with self._lock:
-            return {
-                **self._stats,
-                "current_queue_depth": len(self._active_retries),
-            }
-
-    def save_snapshot(self):
-        with self._lock:
-            try:
-                temp_file = RETRY_JOURNAL_FILE + ".tmp"
-                with open(temp_file, "w") as f:
-                    for challenge_id, item in self._active_retries.items():
-                        entry = {
-                            "ts": datetime.now(timezone.utc).isoformat(),
-                            "action": "add_retry",
-                            "payload": {
-                                "address": item.address,
-                                "challenge_id": item.challenge_id,
-                                "nonce": item.nonce,
-                                "challenge_data": item.challenge_data,
-                                "attempt_count": item.attempt_count,
-                                "next_retry_time": item.next_retry_time.isoformat(),
-                                "first_attempt_time": item.first_attempt_time.isoformat(),
-                                "last_error": item.last_error,
-                            },
-                        }
-                        f.write(json.dumps(entry) + "\n")
-
-                os.replace(temp_file, RETRY_JOURNAL_FILE)
-                
-                try:
-                    os.chmod(RETRY_JOURNAL_FILE, 0o600)
-                except OSError:
-                    pass
-
-                logging.info("Retry journal snapshot saved")
-            except IOError as e:
-                logging.error(f"Failed to save retry journal snapshot: {e}")
 
 
 # --- Worker Functions ---
@@ -619,94 +346,77 @@ def _solve_one_challenge(
         hash_rate = num_hashes / solve_duration if solve_duration > 0 else 0
 
         tui_app.post_message(
-            LogMessage("-----------------------------------------------")
-        )
-        tui_app.post_message(
-            LogMessage(f"🔢 Found nonce: {nonce} for {c['challengeId']}")
-        )
-        tui_app.post_message(LogMessage(f"⏱️ Solved in {solve_duration:.2f} seconds"))
-        tui_app.post_message(LogMessage(f"⚡ Hashrate: {hash_rate:.2f} H/s"))
-
-        submit_url = f"https://scavenger.prod.gd.midnighttge.io/solution/{address}/{c['challengeId']}/{nonce}"
-        submit_response = session.post(submit_url)
-        submit_response.raise_for_status()
-        validated_time = datetime.now(timezone.utc)
-        tui_app.post_message(
-            LogMessage(f"✅ Solution submitted successfully for {c['challengeId']}")
+            LogMessage([
+                "-----------------------------------------------",
+                f"🔢 Found nonce: {nonce} for {c['challengeId']}",
+                f"⏱️ Solved in {solve_duration:.2f} seconds",
+                f"⚡ Hashrate: {hash_rate:.2f} H/s",
+            ])
         )
 
-        try:
-            submission_data = submit_response.json()
-            crypto_receipt = submission_data.get("crypto_receipt")
+        result = submit_solution(address, c["challengeId"], nonce, session)
 
-            update = {}
-            if crypto_receipt:
-                update = {
-                    "status": "validated",
-                    "solvedAt": solved_time.isoformat(timespec="milliseconds").replace(
-                        "+00:00", "Z"
-                    ),
-                    "submittedAt": solved_time.isoformat(
-                        timespec="milliseconds"
-                    ).replace("+00:00", "Z"),
-                    "validatedAt": validated_time.isoformat(
-                        timespec="milliseconds"
-                    ).replace("+00:00", "Z"),
-                    "salt": nonce,
-                    "cryptoReceipt": crypto_receipt,
-                }
-                tui_app.post_message(
-                    LogMessage(
-                        f"🎉 Successfully validated challenge {c['challengeId']}"
-                    )
-                )
-            else:
-                update = {
-                    "status": "solved",  # Submitted but not validated with receipt
-                    "solvedAt": solved_time.isoformat(timespec="milliseconds").replace(
-                        "+00:00", "Z"
-                    ),
-                    "salt": nonce,
-                }
-                tui_app.post_message(
-                    LogMessage(
-                        f"Submission for {c['challengeId']} OK but no crypto_receipt."
-                    )
-                )
-
+        if result.status == "validated":
+            result.update["solvedAt"] = (
+                solved_time.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            )
             tui_app.post_message(
-                LogMessage("-----------------------------------------------")
+                LogMessage([
+                    f"✅ Solution submitted successfully for {c['challengeId']}",
+                    f"🎉 Successfully validated challenge {c['challengeId']}",
+                    "-----------------------------------------------",
+                ])
             )
             tui_app.post_message(SolutionFound())
 
-            updated_status = db_manager.update_challenge(
-                address, c["challengeId"], update
-            )
+            updated_status = db_manager.update_challenge(address, c["challengeId"], result.update)
             if updated_status:
-                tui_app.post_message(
-                    ChallengeUpdate(address, c["challengeId"], updated_status)
-                )
+                tui_app.post_message(ChallengeUpdate(address, c["challengeId"], updated_status))
 
-        except json.JSONDecodeError:
-            msg = f"Failed to decode submission response for {c['challengeId']}."
-            tui_app.post_message(LogMessage(msg))
-            update = {"status": "submission_error", "salt": nonce}
-            updated_status = db_manager.update_challenge(
-                address, c["challengeId"], update
+        elif result.status == "solved":
+            result.update["solvedAt"] = (
+                solved_time.isoformat(timespec="milliseconds").replace("+00:00", "Z")
             )
-            if updated_status:
-                tui_app.post_message(
-                    ChallengeUpdate(address, c["challengeId"], updated_status)
-                )
+            tui_app.post_message(
+                LogMessage([
+                    f"✅ Solution submitted successfully for {c['challengeId']}",
+                    f"Submission for {c['challengeId']} OK but no crypto_receipt.",
+                    "-----------------------------------------------",
+                ])
+            )
+            tui_app.post_message(SolutionFound())
 
-    except subprocess.CalledProcessError as e:
-        msg = f"Rust solver error for {c['challengeId']}: {e.stderr.strip()}"
-        tui_app.post_message(LogMessage(msg))
-        # Revert status to available if solver fails
-        db_manager.update_challenge(address, c["challengeId"], {"status": "available"})
-        tui_app.post_message(ChallengeUpdate(address, c["challengeId"], "available"))
-    except requests.exceptions.RequestException as e:  # ty: ignore
-        if should_retry_error(e):
+            updated_status = db_manager.update_challenge(address, c["challengeId"], result.update)
+            if updated_status:
+                tui_app.post_message(ChallengeUpdate(address, c["challengeId"], updated_status))
+
+        elif result.status == "already_exists":
+            result.update["solvedAt"] = (
+                solved_time.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            )
+            tui_app.post_message(
+                LogMessage([
+                    f"✅ Solution was previously submitted for {c['challengeId']}",
+                    "⚠️  Crypto receipt not available (server accepted but client lost response)",
+                    "📝 Challenge marked as 'solved' - submission confirmed",
+                    "-----------------------------------------------",
+                ])
+            )
+            tui_app.post_message(SolutionFound())
+
+            updated_status = db_manager.update_challenge(address, c["challengeId"], result.update)
+            if updated_status:
+                tui_app.post_message(ChallengeUpdate(address, c["challengeId"], updated_status))
+
+        elif result.status == "submission_error":
+            tui_app.post_message(
+                LogMessage(f"Failed to decode submission response for {c['challengeId']}.")
+            )
+            updated_status = db_manager.update_challenge(address, c["challengeId"], result.update)
+            if updated_status:
+                tui_app.post_message(ChallengeUpdate(address, c["challengeId"], updated_status))
+
+        elif result.status == "should_retry":
             now = datetime.now(timezone.utc)
             retry_item = SubmissionRetryItem(
                 address=address,
@@ -716,53 +426,42 @@ def _solve_one_challenge(
                 attempt_count=1,
                 next_retry_time=now + timedelta(seconds=RETRY_INITIAL_DELAY),
                 first_attempt_time=now,
-                last_error=str(e),
+                last_error=result.error,
             )
 
             if retry_manager.add_retry(retry_item):
-                error_msg = str(e)
-                if len(error_msg) > 100:
-                    error_msg = error_msg[:100] + "..."
                 tui_app.post_message(
-                    LogMessage(f"⚠️  Error submitting solution for {c['challengeId']}: {error_msg}")
+                    LogMessage([
+                        f"⚠️  Error submitting solution for {c['challengeId']}: {result.error}",
+                        f"🔄 Submission queued for retry (attempt 1/{RETRY_MAX_ATTEMPTS}, next retry in {RETRY_INITIAL_DELAY}s)",
+                        "-----------------------------------------------",
+                    ])
                 )
-                tui_app.post_message(
-                    LogMessage(
-                        f"🔄 Submission queued for retry (attempt 1/{RETRY_MAX_ATTEMPTS}, next retry in {RETRY_INITIAL_DELAY}s)"
-                    )
-                )
-                tui_app.post_message(
-                    LogMessage("-----------------------------------------------")
-                )
-                
+
                 db_manager.update_challenge(
                     address, c["challengeId"], {"status": "retrying", "salt": nonce}
                 )
-                tui_app.post_message(
-                    ChallengeUpdate(address, c["challengeId"], "retrying")
-                )
-                tui_app.post_message(
-                    RetryQueued(address, c["challengeId"], 1)
-                )
-        else:
-            error_msg = str(e)
-            if len(error_msg) > 100:
-                error_msg = error_msg[:100] + "..."
+                tui_app.post_message(ChallengeUpdate(address, c["challengeId"], "retrying"))
+                tui_app.post_message(RetryQueued(address, c["challengeId"], 1))
+
+        elif result.status == "failed":
             tui_app.post_message(
-                LogMessage(f"❗️ Error submitting solution for {c['challengeId']}: {error_msg}")
+                    LogMessage([
+                        f"❗️ Error submitting solution for {c['challengeId']}: {result.error}",
+                        "❌ Non-retryable error - submission will NOT be retried",
+                        "-----------------------------------------------",
+                    ])
             )
-            tui_app.post_message(
-                LogMessage("❌ Non-retryable error - submission will NOT be retried")
-            )
-            tui_app.post_message(
-                LogMessage("-----------------------------------------------")
-            )
-            db_manager.update_challenge(
-                address, c["challengeId"], {"status": "submission_error"}
-            )
-            tui_app.post_message(
-                ChallengeUpdate(address, c["challengeId"], "submission_error")
-            )
+
+            db_manager.update_challenge(address, c["challengeId"], {"status": "submission_error"})
+            tui_app.post_message(ChallengeUpdate(address, c["challengeId"], "submission_error"))
+
+    except subprocess.CalledProcessError as e:
+        msg = f"Rust solver error for {c['challengeId']}: {e.stderr.strip()}"
+        tui_app.post_message(LogMessage(msg))
+        # Revert status to available if solver fails
+        db_manager.update_challenge(address, c["challengeId"], {"status": "available"})
+        tui_app.post_message(ChallengeUpdate(address, c["challengeId"], "available"))
     except Exception as e:
         msg = f"An unexpected error occurred during solving: {e}"
         tui_app.post_message(LogMessage(msg))
@@ -941,221 +640,6 @@ def stats_worker(db_manager, stop_event, interval, tui_app):
     logging.info("Stats updater thread stopped.")
 
 
-def retry_worker(db_manager, retry_manager, stop_event, tui_app):
-    tui_app.post_message(LogMessage("Retry worker thread started."))
-
-    while not stop_event.is_set():
-        retry_item = retry_manager.get_next_ready_retry(timeout=1.0)
-
-        if retry_item is None:
-            continue
-
-        c = retry_item.challenge_data
-
-        now = datetime.now(timezone.utc)
-        latest_submission = datetime.fromisoformat(
-            c["latestSubmission"].replace("Z", "+00:00")
-        )
-
-        if now > latest_submission:
-            tui_app.post_message(
-                LogMessage("-----------------------------------------------")
-            )
-            tui_app.post_message(
-                LogMessage(f"⏳ Challenge {c['challengeId']} expired while in retry queue")
-            )
-            tui_app.post_message(
-                LogMessage("⏳ Solution DISCARDED - submission deadline passed")
-            )
-            tui_app.post_message(
-                LogMessage("-----------------------------------------------")
-            )
-
-            retry_manager.remove_retry(c["challengeId"], "expired")
-            db_manager.update_challenge(
-                retry_item.address, c["challengeId"], {"status": "expired"}
-            )
-            tui_app.post_message(
-                ChallengeUpdate(retry_item.address, c["challengeId"], "expired")
-            )
-            tui_app.post_message(RetryExpired(retry_item.address, c["challengeId"]))
-            continue
-
-        tui_app.post_message(
-            LogMessage(
-                f"🔄 Retrying submission for {c['challengeId']} (attempt {retry_item.attempt_count + 1}/{RETRY_MAX_ATTEMPTS})"
-            )
-        )
-
-        try:
-            submit_url = f"https://scavenger.prod.gd.midnighttge.io/solution/{retry_item.address}/{c['challengeId']}/{retry_item.nonce}"
-            submit_response = session.post(submit_url, timeout=30)
-            submit_response.raise_for_status()
-            validated_time = datetime.now(timezone.utc)
-
-            try:
-                submission_data = submit_response.json()
-                crypto_receipt = submission_data.get("crypto_receipt")
-
-                if crypto_receipt:
-                    update = {
-                        "status": "validated",
-                        "submittedAt": validated_time.isoformat(
-                            timespec="milliseconds"
-                        ).replace("+00:00", "Z"),
-                        "validatedAt": validated_time.isoformat(
-                            timespec="milliseconds"
-                        ).replace("+00:00", "Z"),
-                        "salt": retry_item.nonce,
-                        "cryptoReceipt": crypto_receipt,
-                    }
-                    status_msg = "validated"
-                    success_emoji = "🎉"
-                else:
-                    update = {
-                        "status": "solved",
-                        "submittedAt": validated_time.isoformat(
-                            timespec="milliseconds"
-                        ).replace("+00:00", "Z"),
-                        "salt": retry_item.nonce,
-                    }
-                    status_msg = "solved"
-                    success_emoji = "✅"
-
-                tui_app.post_message(
-                    LogMessage("-----------------------------------------------")
-                )
-                tui_app.post_message(
-                    LogMessage(
-                        f"✅ Retry successful! Solution submitted for {c['challengeId']}"
-                    )
-                )
-                tui_app.post_message(
-                    LogMessage(
-                        f"{success_emoji} Successfully {status_msg} challenge {c['challengeId']} (after {retry_item.attempt_count + 1} attempts)"
-                    )
-                )
-                tui_app.post_message(
-                    LogMessage("-----------------------------------------------")
-                )
-                tui_app.post_message(SolutionFound())
-
-                retry_manager.remove_retry(c["challengeId"], "success")
-                updated_status = db_manager.update_challenge(
-                    retry_item.address, c["challengeId"], update
-                )
-                if updated_status:
-                    tui_app.post_message(
-                        ChallengeUpdate(retry_item.address, c["challengeId"], updated_status)
-                    )
-                tui_app.post_message(
-                    RetrySuccess(
-                        retry_item.address, c["challengeId"], retry_item.attempt_count + 1
-                    )
-                )
-
-            except json.JSONDecodeError:
-                tui_app.post_message(
-                    LogMessage(
-                        f"⚠️  Retry attempt {retry_item.attempt_count + 1} failed: Invalid response format"
-                    )
-                )
-                raise
-
-        except requests.exceptions.RequestException as e:
-            error_msg = str(e)
-            if len(error_msg) > 80:
-                error_msg = error_msg[:80] + "..."
-
-            if retry_item.attempt_count + 1 >= RETRY_MAX_ATTEMPTS:
-                tui_app.post_message(
-                    LogMessage("-----------------------------------------------")
-                )
-                tui_app.post_message(
-                    LogMessage(
-                        f"🔄 Retrying submission for {c['challengeId']} (attempt {retry_item.attempt_count + 1}/{RETRY_MAX_ATTEMPTS} - FINAL)"
-                    )
-                )
-                tui_app.post_message(
-                    LogMessage(
-                        f"⚠️  Retry attempt {retry_item.attempt_count + 1} failed: {error_msg}"
-                    )
-                )
-                tui_app.post_message(
-                    LogMessage(f"💀 All retry attempts exhausted for {c['challengeId']}")
-                )
-                elapsed_time = (datetime.now(timezone.utc) - retry_item.first_attempt_time).total_seconds() / 60
-                tui_app.post_message(
-                    LogMessage(
-                        f"💀 Solution LOST - max attempts ({RETRY_MAX_ATTEMPTS}) reached after {elapsed_time:.1f} minutes"
-                    )
-                )
-                tui_app.post_message(
-                    LogMessage("-----------------------------------------------")
-                )
-
-                retry_manager.remove_retry(c["challengeId"], "failed")
-                db_manager.update_challenge(
-                    retry_item.address,
-                    c["challengeId"],
-                    {"status": "submission_failed"},
-                )
-                tui_app.post_message(
-                    ChallengeUpdate(retry_item.address, c["challengeId"], "submission_failed")
-                )
-                tui_app.post_message(
-                    RetryFailed(retry_item.address, c["challengeId"], error_msg)
-                )
-            else:
-                retry_item.attempt_count += 1
-                delay = min(
-                    RETRY_INITIAL_DELAY * (RETRY_BACKOFF_MULTIPLIER ** (retry_item.attempt_count - 1)),
-                    RETRY_MAX_DELAY,
-                )
-                retry_item.next_retry_time = datetime.now(timezone.utc) + timedelta(
-                    seconds=delay
-                )
-                retry_item.last_error = error_msg
-
-                tui_app.post_message(
-                    LogMessage(
-                        f"⚠️  Retry attempt {retry_item.attempt_count} failed: {error_msg}"
-                    )
-                )
-                tui_app.post_message(
-                    LogMessage(
-                        f"🔄 Requeued for retry (attempt {retry_item.attempt_count + 1}/{RETRY_MAX_ATTEMPTS}, next retry in {delay:.0f}s)"
-                    )
-                )
-
-                retry_manager.update_retry_attempt(retry_item)
-                retry_manager._queue.put((retry_item.next_retry_time, retry_item))
-                tui_app.post_message(
-                    RetryAttempting(
-                        retry_item.address,
-                        c["challengeId"],
-                        retry_item.attempt_count,
-                        delay,
-                    )
-                )
-
-        except Exception as e:
-            error_msg = f"Unexpected error during retry: {e}"
-            tui_app.post_message(LogMessage(f"⚠️  {error_msg}"))
-
-            retry_manager.remove_retry(c["challengeId"], "failed")
-            db_manager.update_challenge(
-                retry_item.address,
-                c["challengeId"],
-                {"status": "submission_failed"},
-            )
-            tui_app.post_message(
-                ChallengeUpdate(retry_item.address, c["challengeId"], "submission_failed")
-            )
-
-    logging.info("Retry worker thread stopped.")
-
-
 # --- Main Application Logic ---
 def init_db(json_files):
     """Initializes or updates the main database file from JSON inputs."""
@@ -1163,14 +647,14 @@ def init_db(json_files):
     db = {}
     if os.path.exists(DB_FILE):
         try:
-            with open(DB_FILE, "r") as f:
+            with open(DB_FILE, "r", encoding='utf8') as f:
                 db = json.load(f)
         except json.JSONDecodeError:
             logging.warning(f"Could not read existing {DB_FILE}, starting fresh.")
 
     for file_path in json_files:
         try:
-            with open(file_path, "r") as f:
+            with open(file_path, "r", encoding='utf8') as f:
                 data = json.load(f)
                 address = data.get("registration_receipt", {}).get("walletAddress")
                 if not address:
@@ -1206,7 +690,7 @@ def init_db(json_files):
         except json.JSONDecodeError:
             logging.error(f"Error decoding JSON from {file_path}")
 
-    with open(DB_FILE, "w") as f:
+    with open(DB_FILE, "w", encoding='utf8') as f:
         json.dump(db, f, indent=4)
 
     if os.path.exists(JOURNAL_FILE):
@@ -1232,7 +716,7 @@ def run_orchestrator(args):
     )
 
     db_manager = DatabaseManager()
-    retry_manager = SubmissionRetryManager(db_manager)
+    retry_manager = SubmissionRetryManager(db_manager, RETRY_JOURNAL_FILE)
 
     worker_functions = {
         "fetcher": fetcher_worker,
@@ -1248,6 +732,13 @@ def run_orchestrator(args):
         "stats_interval": args.stats_interval,
         "max_solvers": args.max_solvers,
         "challenge_selection": args.challenge_selection,
+        "session": session,
+        "retry_config": {
+            "initial_delay": RETRY_INITIAL_DELAY,
+            "max_delay": RETRY_MAX_DELAY,
+            "max_attempts": RETRY_MAX_ATTEMPTS,
+            "backoff_multiplier": RETRY_BACKOFF_MULTIPLIER,
+        },
     }
 
     app = OrchestratorTUI(
