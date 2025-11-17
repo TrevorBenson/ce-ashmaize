@@ -6,28 +6,56 @@ __device__ void execute_one_instruction(VMState &vm, const uint8_t *rom,
 
     uint64_t src1, src2;
 
+            // Debug disabled to prevent massive output
+            bool debug_mem = false;
+    
+    // Always evaluate src1
     if (instr.op1 < 5) {
         src1 = vm.regs[instr.r1];
     } else if (instr.op1 < 9) {
-        src1 = mem_access64(vm, rom, instr.lit1, rom_size);
+        if (debug_mem) printf("[GPU] src1 memory access:\n");
+        src1 = mem_access64(vm, rom, instr.lit1, rom_size, debug_mem);
     } else if (instr.op1 < 13) {
         src1 = instr.lit1;
+        if (debug_mem) printf("[GPU] src1 literal: 0x%016llx\n", (unsigned long long)src1);
     } else if (instr.op1 < 14) {
         src1 = special1_value64(vm.prog_digest_state);
+        if (debug_mem) printf("[GPU] src1 special1: 0x%016llx\n", (unsigned long long)src1);
     } else {
         src1 = special2_value64(vm.mem_digest_state);
+        if (debug_mem) printf("[GPU] src1 special2: 0x%016llx\n", (unsigned long long)src1);
     }
 
-    if (instr.op2 < 5) {
-        src2 = vm.regs[instr.r2];
-    } else if (instr.op2 < 9) {
-        src2 = mem_access64(vm, rom, instr.lit2, rom_size);
-    } else if (instr.op2 < 13) {
-        src2 = instr.lit2;
-    } else if (instr.op2 < 14) {
-        src2 = special1_value64(vm.prog_digest_state);
+    // Only evaluate src2 for Op3 instructions (opcodes that need two operands)
+    // Op2 instructions: ISqrt(128-137), BitRev(138-147), RotL(188-203), RotR(204-219), Neg(220-239)
+    // Op3 instructions: everything else
+    bool is_op2 = (instr.opcode >= 128 && instr.opcode < 148) ||   // ISqrt, BitRev
+                  (instr.opcode >= 188 && instr.opcode < 240);      // RotL, RotR, Neg
+    bool is_op3 = !is_op2;
+    if (is_op3) {
+        if (instr.op2 < 5) {
+            src2 = vm.regs[instr.r2];
+            if (debug_mem) printf("[GPU] src2 register[%u]: 0x%016llx\n", instr.r2, (unsigned long long)src2);
+        } else if (instr.op2 < 9) {
+            if (debug_mem) printf("[GPU] src2 memory access:\n");
+            src2 = mem_access64(vm, rom, instr.lit2, rom_size, debug_mem);
+        } else if (instr.op2 < 13) {
+            src2 = instr.lit2;
+            if (debug_mem) printf("[GPU] src2 literal: 0x%016llx\n", (unsigned long long)src2);
+        } else if (instr.op2 < 14) {
+            src2 = special1_value64(vm.prog_digest_state);
+            if (debug_mem) printf("[GPU] src2 special1: 0x%016llx\n", (unsigned long long)src2);
+        } else {
+            src2 = special2_value64(vm.mem_digest_state);
+            if (debug_mem) printf("[GPU] src2 special2: 0x%016llx\n", (unsigned long long)src2);
+        }
     } else {
-        src2 = special2_value64(vm.mem_digest_state);
+        src2 = 0;  // Not used for Op2 instructions
+    }
+    
+    if (debug_mem) {
+        printf("[GPU] Computed src1=0x%016llx, src2=0x%016llx\n",
+            (unsigned long long)src1, (unsigned long long)src2);
     }
 
     uint64_t result;
@@ -53,7 +81,7 @@ __device__ void execute_one_instruction(VMState &vm, const uint8_t *rom,
     } else if (instr.opcode < 112) {
         result = (src2 != 0) ? src1 / src2 : special1_value64(vm.prog_digest_state);
     } else if (instr.opcode < 128) {
-        result = (src2 != 0) ? src1 / src2 : special1_value64(vm.prog_digest_state);
+        result = (src2 != 0) ? src1 % src2 : special1_value64(vm.prog_digest_state);
     } else if (instr.opcode < 138) {
         result = isqrt_64(src1);
     } else if (instr.opcode < 148) {
@@ -66,14 +94,22 @@ __device__ void execute_one_instruction(VMState &vm, const uint8_t *rom,
     } else if (instr.opcode < 188) {
         result = src1 ^ src2;
     } else if (instr.opcode < 204) {
-        result = (src1 << (instr.r1 & 0x3F)) | (src1 >> (64 - (instr.r1 & 0x3F)));
+        // RotL - handle edge case where r1=0 would cause shift by 64
+        uint32_t shift = instr.r1 & 0x3F;
+        result = shift == 0 ? src1 : ((src1 << shift) | (src1 >> (64 - shift)));
     } else if (instr.opcode < 220) {
-        result = (src1 >> (instr.r1 & 0x3F)) | (src1 << (64 - (instr.r1 & 0x3F)));
+        // RotR - handle edge case where r1=0 would cause shift by 64
+        uint32_t shift = instr.r1 & 0x3F;
+        result = shift == 0 ? src1 : ((src1 >> shift) | (src1 << (64 - shift)));
     } else if (instr.opcode < 240) {
         result = ~src1;
     } else if (instr.opcode < 248) {
         result = src1 & src2;
     } else {
+        // Blake2b Hash operation (opcode 248-255)
+        // The v parameter (opcode - 248) selects which 8-byte chunk from the 64-byte output
+        uint8_t v = instr.opcode - 248;  // v is 0-7
+        
         uint8_t input[16];
         for (int i = 0; i < 8; ++i) {
             input[i] = (src1 >> (i * 8)) & 0xFF;
@@ -82,21 +118,47 @@ __device__ void execute_one_instruction(VMState &vm, const uint8_t *rom,
             input[8 + i] = (src2 >> (i * 8)) & 0xFF;
         }
         
+        if (debug_mem) {
+            printf("[GPU] Blake2b Hash operation (v=%u):\n", v);
+            printf("  Input (16 bytes): ");
+            for (int i = 0; i < 16; i++) printf("%02x", input[i]);
+            printf("\n");
+        }
+        
         uint8_t hash_out[64];
         blake2b(hash_out, 64, input, 16);
         
-        result = ((uint64_t)hash_out[0] << 0) |
-                 ((uint64_t)hash_out[1] << 8) |
-                 ((uint64_t)hash_out[2] << 16) |
-                 ((uint64_t)hash_out[3] << 24) |
-                 ((uint64_t)hash_out[4] << 32) |
-                 ((uint64_t)hash_out[5] << 40) |
-                 ((uint64_t)hash_out[6] << 48) |
-                 ((uint64_t)hash_out[7] << 56);
+        if (debug_mem) {
+            printf("  Hash output (64 bytes):\n");
+            for (int i = 0; i < 64; i++) {
+                if (i % 16 == 0 && i > 0) printf("\n");
+                if (i % 16 == 0) printf("    ");
+                printf("%02x", hash_out[i]);
+            }
+            printf("\n");
+        }
+        
+        // Select the v-th 8-byte chunk (v ranges from 0 to 7)
+        uint32_t offset = v * 8;
+        result = ((uint64_t)hash_out[offset + 0] << 0) |
+                 ((uint64_t)hash_out[offset + 1] << 8) |
+                 ((uint64_t)hash_out[offset + 2] << 16) |
+                 ((uint64_t)hash_out[offset + 3] << 24) |
+                 ((uint64_t)hash_out[offset + 4] << 32) |
+                 ((uint64_t)hash_out[offset + 5] << 40) |
+                 ((uint64_t)hash_out[offset + 6] << 48) |
+                 ((uint64_t)hash_out[offset + 7] << 56);
+        
+        if (debug_mem) {
+            printf("  Extracted chunk %u (offset %u): 0x%016llx\n", v, offset, (unsigned long long)result);
+        }
     }
 
     vm.regs[instr.r3] = result;
     vm.ip = vm.ip + 1;
+    
+    // Update prog_digest with the instruction chunk (20 bytes)
+    blake2b_update(vm.prog_digest_state, prog_chunk, INSTR_SIZE);
 }
 
 extern "C" __global__ void ashmaize_hash_kernel(
@@ -126,14 +188,48 @@ extern "C" __global__ void ashmaize_hash_kernel(
     VMState vm;
     vm_init(vm, rom_digest, 64, salt, salt_len);
 
+    uint32_t loop_mem_prev = 0;
     for (uint32_t loop = 0; loop < nb_loops; ++loop) {
         hprime(program, program_size, vm.prog_seed, 64);
 
         for (uint32_t instr_idx = 0; instr_idx < nb_instrs; ++instr_idx) {
+    // Debug disabled - Bug #11 fixed!
+    // if (tid == 0 && loop == 0 && instr_idx < 10) { ... }
+            
+            // Use instr_idx because program gets reshuffled each loop (hprime above)
             execute_one_instruction(vm, rom_data, program + instr_idx * INSTR_SIZE, rom_size);
+            
+        // Debug disabled - Bug #11 fixed!
+        // if (tid == 0 && loop == 0 && instr_idx < 10) { ... }
         }
 
         post_instructions(vm);
+        
+        // Debug: Print per-loop memory access count and prog_seed
+        if (tid == 0) {
+            uint32_t this_loop_count = vm.memory_counter - loop_mem_prev;
+            printf("GPU Loop %u: %u memory accesses (total: %u)\n", 
+                loop, this_loop_count, vm.memory_counter);
+            
+            if (loop == 0) {
+                printf("  prog_seed after loop 0: ");
+                for (int i = 0; i < 64; i++) printf("%02x", vm.prog_seed[i]);
+                printf("\n");
+            }
+            
+            loop_mem_prev = vm.memory_counter;
+        }
+    }
+
+    // Debug output for first thread only
+    if (tid == 0) {
+        printf("GPU Before finalize:\n");
+        printf("  memory_counter: %u\n", vm.memory_counter);
+        printf("  loop_counter: %u\n", vm.loop_counter);
+        printf("  ip: %u\n", vm.ip);
+        printf("  regs[0]: 0x%016llx\n", (unsigned long long)vm.regs[0]);
+        printf("  regs[1]: 0x%016llx\n", (unsigned long long)vm.regs[1]);
+        printf("  regs[31]: 0x%016llx\n", (unsigned long long)vm.regs[31]);
     }
 
     Blake2bState final_prog_state = vm.prog_digest_state;

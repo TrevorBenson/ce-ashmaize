@@ -121,13 +121,28 @@ __device__ uint64_t special2_value64(Blake2bState &mem_digest_state) {
            ((uint64_t)out[7] << 56);
 }
 
-__device__ uint64_t mem_access64(VMState &vm, const uint8_t *rom, uint64_t addr, uint32_t rom_size) {
-    uint32_t rom_addr = addr % rom_size;
-    uint32_t chunk_start_idx = (rom_addr / 64) * 64;
+__device__ uint64_t mem_access64(VMState &vm, const uint8_t *rom, uint64_t addr, uint32_t rom_size, bool debug = false) {
+    // BUG #11: CPU's rom.at() treats the modulo result as a BYTE INDEX, not chunk index!
+    // CPU does: start = addr % num_chunks, then reads data[start..start+64]
+    // So we must match this buggy behavior exactly
+    uint32_t num_chunks = rom_size / 64;
+    uint32_t chunk_start_idx = (addr % num_chunks);  // This is the BUG - should be * 64!
     uint8_t mem_chunk[64];
 
     for (uint32_t i = 0; i < 64; ++i) {
-        mem_chunk[i] = rom[(chunk_start_idx + i) % rom_size];
+        mem_chunk[i] = rom[chunk_start_idx + i];
+    }
+
+    // Debug all memory accesses for thread 0 - count per loop
+    static __device__ int loop_mem_counts[10] = {0};  // Max 10 loops
+    if (debug && blockIdx.x * blockDim.x + threadIdx.x == 0) {
+        if (vm.loop_counter < 10) {
+            loop_mem_counts[vm.loop_counter]++;
+        }
+        if (vm.memory_counter < 20 || vm.memory_counter > 900) {
+            printf("[GPU mem_%u] loop=%u, ip=%u\n",
+                vm.memory_counter, vm.loop_counter, vm.ip);
+        }
     }
 
     blake2b_update(vm.mem_digest_state, mem_chunk, 64);
@@ -142,6 +157,11 @@ __device__ uint64_t mem_access64(VMState &vm, const uint8_t *rom, uint64_t addr,
                       ((uint64_t)mem_chunk[idx_in_chunk + 5] << 40) |
                       ((uint64_t)mem_chunk[idx_in_chunk + 6] << 48) |
                       ((uint64_t)mem_chunk[idx_in_chunk + 7] << 56);
+
+    if (debug) {
+        printf("  mem_ctr_after=%u, idx_in_chunk=%u, result=0x%016llx\n",
+            vm.memory_counter, idx_in_chunk, (unsigned long long)result);
+    }
 
     return result;
 }
@@ -182,18 +202,24 @@ __device__ uint64_t isqrt_64(uint64_t x) {
     if (x < 2) {
         return x;
     }
-    uint64_t y = (x + 1) / 2;
-    while (y < x) {
-        x = y;
-        y = (x + x / x) / 2;
+    uint64_t y = x;
+    uint64_t z = (x + 1) / 2;
+    while (z < y) {
+        y = z;
+        z = (z + x / z) / 2;
     }
-    return x;
+    return y;
 }
 
 __device__ void post_instructions(VMState &vm) {
     uint64_t sum = 0;
     for (int i = 0; i < NB_REGS; ++i) {
         sum = sum + vm.regs[i];
+    }
+    
+    // Debug: Print sum after loop 0
+    if (vm.loop_counter == 0 && blockIdx.x * blockDim.x + threadIdx.x == 0) {
+        printf("[GPU post_instr loop 0] sum_regs=0x%016llx\n", (unsigned long long)sum);
     }
 
     uint8_t sum_bytes[8];
@@ -219,26 +245,20 @@ __device__ void post_instructions(VMState &vm) {
     blake2b_final(temp_mem_state, mem_value, 64);
 
     // Compute mixing_value = blake2b(prog_value || mem_value || loop_counter)
-    uint8_t mixing_input[136];  // 64 + 64 + 8
+    // NOTE: loop_counter is u32, so only 4 bytes in little-endian!
+    uint8_t mixing_input[132];  // 64 + 64 + 4
     for (int i = 0; i < 64; ++i) {
         mixing_input[i] = prog_value[i];
         mixing_input[64 + i] = mem_value[i];
     }
-    uint8_t loop_counter_bytes[8];
-    loop_counter_bytes[0] = (uint8_t)(vm.loop_counter >> 0);
-    loop_counter_bytes[1] = (uint8_t)(vm.loop_counter >> 8);
-    loop_counter_bytes[2] = (uint8_t)(vm.loop_counter >> 16);
-    loop_counter_bytes[3] = (uint8_t)(vm.loop_counter >> 24);
-    loop_counter_bytes[4] = (uint8_t)(vm.loop_counter >> 32);
-    loop_counter_bytes[5] = (uint8_t)(vm.loop_counter >> 40);
-    loop_counter_bytes[6] = (uint8_t)(vm.loop_counter >> 48);
-    loop_counter_bytes[7] = (uint8_t)(vm.loop_counter >> 56);
-    for (int i = 0; i < 8; ++i) {
-        mixing_input[128 + i] = loop_counter_bytes[i];
-    }
+    // Encode loop_counter as little-endian u32 (4 bytes only!)
+    mixing_input[128] = (uint8_t)(vm.loop_counter >> 0);
+    mixing_input[129] = (uint8_t)(vm.loop_counter >> 8);
+    mixing_input[130] = (uint8_t)(vm.loop_counter >> 16);
+    mixing_input[131] = (uint8_t)(vm.loop_counter >> 24);
     
     uint8_t mixing_value[64];
-    blake2b(mixing_value, 64, mixing_input, 136);
+    blake2b(mixing_value, 64, mixing_input, 132);
 
     // Run hprime on mixing_value to get mixing_out
     uint8_t mixing_out[NB_REGS * 8 * 32];  // NB_REGS * REGISTER_SIZE * 32
@@ -266,7 +286,7 @@ __device__ void post_instructions(VMState &vm) {
     }
 
     vm.loop_counter++;
-    vm.ip = 0;
+    vm.ip = 0;  // Reset ip for next loop since program gets reshuffled
 }
 
 #endif

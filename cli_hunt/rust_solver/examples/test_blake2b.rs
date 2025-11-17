@@ -23,8 +23,9 @@ fn main() {
 
         println!("CPU Reference Results:");
         for (name, input) in &test_cases {
-            let hash = Blake2b512::digest(input);
-            println!("  {}: {}", name, hex::encode(&hash[..16]));
+            // Use blake2b_simd which is available in ashmaize
+            let hash = blake2b_simd::blake2b(input);
+            println!("  {}: {}", name, hex::encode(&hash.as_bytes()[..16]));
         }
 
         // Test GPU
@@ -64,16 +65,16 @@ fn main() {
         
         println!("\nComparison:");
         for (i, (name, input)) in test_cases.iter().enumerate() {
-            let cpu_hash = Blake2b512::digest(input);
+            let cpu_hash = blake2b_simd::blake2b(input);
             let gpu_start = i * 64;
             let gpu_hash = &results_host[gpu_start..gpu_start+64];
             
-            let matches = cpu_hash.as_slice() == gpu_hash;
+            let matches = cpu_hash.as_bytes() == gpu_hash;
             let marker = if matches { "✓" } else { "✗" };
             println!("  {} {}", marker, name);
             
             if !matches {
-                println!("    CPU: {}", hex::encode(&cpu_hash[..]));
+                println!("    CPU: {}", hex::encode(cpu_hash.as_bytes()));
                 println!("    GPU: {}", hex::encode(gpu_hash));
             }
         }
