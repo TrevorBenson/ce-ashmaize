@@ -42,6 +42,10 @@ struct Args {
     use_gpu: bool,
     
     #[cfg(feature = "cuda")]
+    #[arg(long, default_value = "0")]
+    gpu_id: usize,
+    
+    #[cfg(feature = "cuda")]
     #[arg(long, default_value = "1024")]
     gpu_batch_size: usize,
 }
@@ -153,7 +157,7 @@ fn main() {
             nonce,
         }) => {
             let nonce_val = u64::from_str_radix(&nonce, 16).unwrap();
-            benchmark::run_single_hash_test(
+            if let Err(e) = benchmark::run_single_hash_test(
                 &address,
                 &challenge_id,
                 &difficulty,
@@ -161,8 +165,10 @@ fn main() {
                 &latest_submission,
                 &no_pre_mine_hour,
                 nonce_val,
-            )
-            .unwrap();
+            ) {
+                eprintln!("Error during hash test: {:?}", e);
+                std::process::exit(1);
+            }
         }
         None => {
             let address = args.address.expect("--address required");
@@ -175,6 +181,8 @@ fn main() {
             #[cfg(feature = "cuda")]
             let use_gpu = args.use_gpu;
             #[cfg(feature = "cuda")]
+            let gpu_id = args.gpu_id;
+            #[cfg(feature = "cuda")]
             let gpu_batch_size = args.gpu_batch_size;
 
             solve(
@@ -186,6 +194,8 @@ fn main() {
                 &no_pre_mine_hour,
                 #[cfg(feature = "cuda")]
                 use_gpu,
+                #[cfg(feature = "cuda")]
+                gpu_id,
                 #[cfg(feature = "cuda")]
                 gpu_batch_size,
             );
@@ -201,6 +211,7 @@ fn solve(
     latest_submission: &str,
     no_pre_mine_hour: &str,
     #[cfg(feature = "cuda")] use_gpu: bool,
+    #[cfg(feature = "cuda")] gpu_id: usize,
     #[cfg(feature = "cuda")] gpu_batch_size: usize,
 ) {
     let rom = init_rom(no_pre_mine);
@@ -213,7 +224,7 @@ fn solve(
 
     #[cfg(feature = "cuda")]
     if use_gpu {
-        solve_with_gpu(&rom, &suffix, difficulty_mask, gpu_batch_size);
+        solve_with_gpu(&rom, &suffix, difficulty_mask, gpu_batch_size, gpu_id);
         return;
     }
 
@@ -256,17 +267,17 @@ fn solve_cpu_only(rom: &Rom, suffix: &str, difficulty_mask: u32) {
 }
 
 #[cfg(feature = "cuda")]
-fn solve_with_gpu(rom: &Rom, suffix: &str, difficulty_mask: u32, batch_size: usize) {
+fn solve_with_gpu(rom: &Rom, suffix: &str, difficulty_mask: u32, batch_size: usize, gpu_id: usize) {
     use std::sync::Mutex;
 
-    let cuda = match gpu::CudaAshmaize::new() {
+    let cuda = match gpu::CudaAshmaize::new_with_device(gpu_id) {
         Ok(c) => {
-            eprintln!("GPU initialized successfully");
+            eprintln!("GPU {} initialized successfully", gpu_id);
             eprintln!("{}", c.get_device_info().unwrap());
             Arc::new(c)
         }
         Err(e) => {
-            eprintln!("Failed to initialize GPU: {}, falling back to CPU", e);
+            eprintln!("Failed to initialize GPU {}: {}, falling back to CPU", gpu_id, e);
             solve_cpu_only(rom, suffix, difficulty_mask);
             return;
         }

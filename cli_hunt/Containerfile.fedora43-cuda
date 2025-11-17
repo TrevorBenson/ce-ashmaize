@@ -1,0 +1,45 @@
+# Alternative: Keep Fedora 43 base and add CUDA toolkit
+# NOTE: This is larger and takes longer to build than using nvidia/cuda base image
+FROM docker.io/library/fedora:43
+
+# Install basic tools
+RUN dnf -y install curl cargo jq git rust
+
+# Install CUDA Toolkit for Fedora
+# Add NVIDIA CUDA repository
+RUN dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/fedora39/x86_64/cuda-fedora39.repo
+
+# Install CUDA toolkit (development version needed for nvcc)
+RUN dnf -y install cuda-toolkit-12-6 cuda-compiler-12-6 cuda-libraries-devel-12-6
+
+# Install additional build dependencies
+RUN dnf -y install gcc gcc-c++ make
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone repository
+RUN git clone https://github.com/mpizenberg/ce-ashmaize.git
+
+# Checkout branch
+RUN cd ce-ashmaize && git checkout piz
+
+# Set CUDA environment variables
+ENV PATH="/usr/local/cuda-12.6/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH}"
+ENV CUDA_HOME="/usr/local/cuda-12.6"
+
+# Build Rust solver WITH CUDA support
+RUN cd ce-ashmaize/cli_hunt/rust_solver \
+    && cargo build --release --features cuda
+
+# Setup Python orchestrator
+RUN cd ce-ashmaize/cli_hunt/python_orchestrator \
+    && ~/.local/bin/uv sync
+
+# Set working directory
+WORKDIR /ce-ashmaize/cli_hunt
+
+# Default command
+CMD ["/ce-ashmaize/cli_hunt/rust_solver/target/release/ashmaize-solver", "--help"]
+

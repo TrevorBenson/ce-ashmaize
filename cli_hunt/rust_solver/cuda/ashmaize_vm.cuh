@@ -206,14 +206,63 @@ __device__ void post_instructions(VMState &vm) {
     sum_bytes[6] = (uint8_t)(sum >> 48);
     sum_bytes[7] = (uint8_t)(sum >> 56);
 
-    blake2b_update(vm.prog_digest_state, sum_bytes, 8);
+    // Clone and update prog_digest
+    Blake2bState temp_prog_state = vm.prog_digest_state;
+    blake2b_update(temp_prog_state, sum_bytes, 8);
+    uint8_t prog_value[64];
+    blake2b_final(temp_prog_state, prog_value, 64);
 
-    Blake2bState temp_state = vm.prog_digest_state;
-    uint8_t digest_out[64];
-    blake2b_final(temp_state, digest_out, 64);
+    // Clone and update mem_digest
+    Blake2bState temp_mem_state = vm.mem_digest_state;
+    blake2b_update(temp_mem_state, sum_bytes, 8);
+    uint8_t mem_value[64];
+    blake2b_final(temp_mem_state, mem_value, 64);
 
+    // Compute mixing_value = blake2b(prog_value || mem_value || loop_counter)
+    uint8_t mixing_input[136];  // 64 + 64 + 8
     for (int i = 0; i < 64; ++i) {
-        vm.prog_seed[i] = digest_out[i];
+        mixing_input[i] = prog_value[i];
+        mixing_input[64 + i] = mem_value[i];
+    }
+    uint8_t loop_counter_bytes[8];
+    loop_counter_bytes[0] = (uint8_t)(vm.loop_counter >> 0);
+    loop_counter_bytes[1] = (uint8_t)(vm.loop_counter >> 8);
+    loop_counter_bytes[2] = (uint8_t)(vm.loop_counter >> 16);
+    loop_counter_bytes[3] = (uint8_t)(vm.loop_counter >> 24);
+    loop_counter_bytes[4] = (uint8_t)(vm.loop_counter >> 32);
+    loop_counter_bytes[5] = (uint8_t)(vm.loop_counter >> 40);
+    loop_counter_bytes[6] = (uint8_t)(vm.loop_counter >> 48);
+    loop_counter_bytes[7] = (uint8_t)(vm.loop_counter >> 56);
+    for (int i = 0; i < 8; ++i) {
+        mixing_input[128 + i] = loop_counter_bytes[i];
+    }
+    
+    uint8_t mixing_value[64];
+    blake2b(mixing_value, 64, mixing_input, 136);
+
+    // Run hprime on mixing_value to get mixing_out
+    uint8_t mixing_out[NB_REGS * 8 * 32];  // NB_REGS * REGISTER_SIZE * 32
+    hprime(mixing_out, NB_REGS * 8 * 32, mixing_value, 64);
+
+    // XOR mixing_out into registers in chunks of NB_REGS * 8
+    for (int chunk = 0; chunk < 32; ++chunk) {
+        for (int reg_idx = 0; reg_idx < NB_REGS; ++reg_idx) {
+            int offset = chunk * NB_REGS * 8 + reg_idx * 8;
+            uint64_t xor_value = ((uint64_t)mixing_out[offset + 0] << 0) |
+                                 ((uint64_t)mixing_out[offset + 1] << 8) |
+                                 ((uint64_t)mixing_out[offset + 2] << 16) |
+                                 ((uint64_t)mixing_out[offset + 3] << 24) |
+                                 ((uint64_t)mixing_out[offset + 4] << 32) |
+                                 ((uint64_t)mixing_out[offset + 5] << 40) |
+                                 ((uint64_t)mixing_out[offset + 6] << 48) |
+                                 ((uint64_t)mixing_out[offset + 7] << 56);
+            vm.regs[reg_idx] ^= xor_value;
+        }
+    }
+
+    // Update prog_seed for next iteration
+    for (int i = 0; i < 64; ++i) {
+        vm.prog_seed[i] = prog_value[i];
     }
 
     vm.loop_counter++;

@@ -18,9 +18,6 @@ fn main() {
     let cuda_path = find_cuda_path();
     
     if let Some(cuda_root) = cuda_path {
-        println!("cargo:rustc-link-search=native={}/lib64", cuda_root);
-        println!("cargo:rustc-link-lib=cudart");
-        
         let out_dir = env::var("OUT_DIR").unwrap();
         let cuda_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("cuda");
         let ptx_path = PathBuf::from(&out_dir).join("ashmaize.ptx");
@@ -30,7 +27,7 @@ fn main() {
         let output = Command::new(&nvcc)
             .args(&[
                 "-ptx",
-                "-arch=sm_60",
+                "-arch=sm_89",
                 "-I", cuda_dir.to_str().unwrap(),
                 "-o", ptx_path.to_str().unwrap(),
                 cuda_dir.join("ashmaize.cu").to_str().unwrap(),

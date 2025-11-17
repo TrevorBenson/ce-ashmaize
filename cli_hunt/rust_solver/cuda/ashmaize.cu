@@ -99,7 +99,7 @@ __device__ void execute_one_instruction(VMState &vm, const uint8_t *rom,
     vm.ip = vm.ip + 1;
 }
 
-__global__ void ashmaize_hash_kernel(
+extern "C" __global__ void ashmaize_hash_kernel(
     const uint8_t* rom_data,
     uint32_t rom_size,
     const uint8_t* rom_digest,
@@ -119,7 +119,7 @@ __global__ void ashmaize_hash_kernel(
         return;
     }
 
-    const uint8_t* salt = salts + tid * 32;
+    const uint8_t* salt = salts + tid * salt_len;
     uint8_t* program = programs + tid * program_size;
     uint8_t* result = results + tid * 64;
 
@@ -144,12 +144,35 @@ __global__ void ashmaize_hash_kernel(
     uint8_t mem_final[64];
     blake2b_final(final_mem_state, mem_final, 64);
 
-    uint8_t combined[128];
+    // Finalize: blake2b(prog_digest || mem_digest || memory_counter || all_regs)
+    uint8_t final_input[64 + 64 + 4 + (NB_REGS * 8)];
+    int pos = 0;
+    
     for (int i = 0; i < 64; ++i) {
-        combined[i] = prog_final[i];
-        combined[64 + i] = mem_final[i];
+        final_input[pos++] = prog_final[i];
     }
-
-    blake2b(result, 64, combined, 128);
+    for (int i = 0; i < 64; ++i) {
+        final_input[pos++] = mem_final[i];
+    }
+    
+    // memory_counter as little-endian u32
+    final_input[pos++] = (uint8_t)(vm.memory_counter >> 0);
+    final_input[pos++] = (uint8_t)(vm.memory_counter >> 8);
+    final_input[pos++] = (uint8_t)(vm.memory_counter >> 16);
+    final_input[pos++] = (uint8_t)(vm.memory_counter >> 24);
+    
+    // All registers as little-endian u64
+    for (int i = 0; i < NB_REGS; ++i) {
+        final_input[pos++] = (uint8_t)(vm.regs[i] >> 0);
+        final_input[pos++] = (uint8_t)(vm.regs[i] >> 8);
+        final_input[pos++] = (uint8_t)(vm.regs[i] >> 16);
+        final_input[pos++] = (uint8_t)(vm.regs[i] >> 24);
+        final_input[pos++] = (uint8_t)(vm.regs[i] >> 32);
+        final_input[pos++] = (uint8_t)(vm.regs[i] >> 40);
+        final_input[pos++] = (uint8_t)(vm.regs[i] >> 48);
+        final_input[pos++] = (uint8_t)(vm.regs[i] >> 56);
+    }
+    
+    blake2b(result, 64, final_input, pos);
 }
 

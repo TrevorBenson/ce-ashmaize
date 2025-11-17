@@ -8,11 +8,12 @@ ashmaize = { path = "../../" } # This points to the root ashmaize crate
 hex = "0.4"
 clap = { version = "4.0", features = ["derive"] }
 rayon = "1.11.0"
-cudarc = { version = "0.10", features = ["cuda-12060"], optional = true }
+cudarc = { version = "0.12", features = ["cuda-12060", "driver", "nvrtc"], default-features = false, optional = true }
 
 [features]
 default = []
 cuda = ["cudarc"]
+multi-gpu = ["cuda"]
 
 [build]
 rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-s"]

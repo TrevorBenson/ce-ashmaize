@@ -1,0 +1,20 @@
+FROM docker.io/library/fedora:43
+
+# NOTE: For GPU support, use Containerfile.cuda (nvidia/cuda base) 
+# or Containerfile.fedora43-cuda (adds CUDA to this base)
+
+RUN dnf -y install curl cargo jq git rust
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+RUN git clone https://github.com/mpizenberg/ce-ashmaize.git
+
+RUN cd ce-ashmaize \
+    && git checkout piz
+
+# CPU-only build (original)
+# For GPU: see Containerfile.cuda or Containerfile.fedora43-cuda
+RUN cd ce-ashmaize/cli_hunt/rust_solver \
+    && cargo build --release
+
+RUN cd ce-ashmaize/cli_hunt/python_orchestrator \
+    && ~/.local/bin/uv sync

@@ -1,9 +1,51 @@
 use ashmaize::b2::VM;
-use ashmaize::{Rom, RomDigest};
+use ashmaize::Rom;
 use cudarc::driver::*;
+use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
 
-pub type GpuResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+#[derive(Debug)]
+pub enum GpuError {
+    DriverError(DriverError),
+    Other(String),
+}
+
+impl std::fmt::Display for GpuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GpuError::DriverError(e) => write!(f, "CUDA driver error: {:?}", e),
+            GpuError::Other(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+impl std::error::Error for GpuError {}
+
+impl From<DriverError> for GpuError {
+    fn from(e: DriverError) -> Self {
+        GpuError::DriverError(e)
+    }
+}
+
+impl From<std::io::Error> for GpuError {
+    fn from(e: std::io::Error) -> Self {
+        GpuError::Other(e.to_string())
+    }
+}
+
+impl From<String> for GpuError {
+    fn from(s: String) -> Self {
+        GpuError::Other(s)
+    }
+}
+
+impl From<&str> for GpuError {
+    fn from(s: &str) -> Self {
+        GpuError::Other(s.to_string())
+    }
+}
+
+pub type GpuResult<T> = Result<T, GpuError>;
 
 pub struct CudaAshmaize {
     device: Arc<CudaDevice>,
@@ -12,7 +54,11 @@ pub struct CudaAshmaize {
 
 impl CudaAshmaize {
     pub fn new() -> GpuResult<Self> {
-        let device = CudaDevice::new(0)?;
+        Self::new_with_device(0)
+    }
+
+    pub fn new_with_device(device_id: usize) -> GpuResult<Self> {
+        let device = CudaDevice::new(device_id)?;
 
         let ptx = compile_kernel()?;
         device.load_ptx(ptx.clone(), "ashmaize", &["ashmaize_hash_kernel"])?;
@@ -26,6 +72,10 @@ impl CudaAshmaize {
         })
     }
 
+    pub fn get_device_count() -> GpuResult<usize> {
+        Ok(cudarc::driver::result::device::get_count()? as usize)
+    }
+
     pub fn hash_parallel(
         &self,
         salts: &[&[u8]],
@@ -36,12 +86,17 @@ impl CudaAshmaize {
         let num_hashes = salts.len();
         let program_size = nb_instrs as usize * 20;
 
+        // Find max salt length
+        let max_salt_len = salts.iter().map(|s| s.len()).max().unwrap_or(0);
+        
+        // Pack salts with proper length (no truncation)
         let mut all_salts = Vec::new();
         for salt in salts {
-            let mut padded_salt = vec![0u8; 32];
-            let len = std::cmp::min(salt.len(), 32);
-            padded_salt[..len].copy_from_slice(&salt[..len]);
-            all_salts.extend_from_slice(&padded_salt);
+            all_salts.extend_from_slice(salt);
+            // Pad to max length if needed for alignment
+            for _ in salt.len()..max_salt_len {
+                all_salts.push(0);
+            }
         }
 
         let mut initial_prog_seeds = Vec::new();
@@ -57,13 +112,13 @@ impl CudaAshmaize {
         }
 
         let rom_buffer = self.device.htod_sync_copy(&rom.data)?;
-        let rom_digest_buffer = self.device.htod_sync_copy(&rom.digest.0)?;
+        let rom_digest_buffer = self.device.htod_sync_copy(rom.digest.as_bytes())?;
         let salts_buffer = self.device.htod_sync_copy(&all_salts)?;
         let initial_prog_seeds_buffer = self.device.htod_sync_copy(&initial_prog_seeds)?;
         let mut programs_buffer = self.device.htod_sync_copy(&all_programs)?;
         let mut results_buffer = self.device.alloc_zeros::<u8>(num_hashes * 64)?;
 
-        let salt_len = salts[0].len() as u32;
+        let salt_len = max_salt_len as u32;
 
         let threads_per_block = 256;
         let num_blocks = (num_hashes as u32 + threads_per_block - 1) / threads_per_block;
@@ -75,7 +130,7 @@ impl CudaAshmaize {
         };
 
         unsafe {
-            self.kernel_func.launch(
+            self.kernel_func.clone().launch(
                 cfg,
                 (
                     &rom_buffer,
@@ -108,41 +163,21 @@ impl CudaAshmaize {
 
     pub fn get_device_info(&self) -> GpuResult<String> {
         Ok(format!(
-            "CUDA Device: {}\nCompute Capability: {}.{}",
+            "CUDA Device: {}",
             self.device.name()?,
-            self.device.attribute(CudaDeviceAttribute::ComputeCapabilityMajor)?,
-            self.device.attribute(CudaDeviceAttribute::ComputeCapabilityMinor)?,
         ))
     }
 }
 
-fn compile_kernel() -> GpuResult<CudaPtx> {
-    let cuda_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cuda");
+fn compile_kernel() -> GpuResult<Ptx> {
+    // Load PTX that was compiled during build time by build.rs
+    // The PTX is embedded in the binary as a static string
+    const PTX_SRC: &str = include_str!(concat!(env!("OUT_DIR"), "/ashmaize.ptx"));
     
-    let output = std::process::Command::new("nvcc")
-        .args(&[
-            "-ptx",
-            "-arch=sm_60",
-            "-o",
-            cuda_dir.join("ashmaize.ptx").to_str().unwrap(),
-            cuda_dir.join("ashmaize.cu").to_str().unwrap(),
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "nvcc compilation failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-
-    let ptx_path = cuda_dir.join("ashmaize.ptx");
-    let ptx_string = std::fs::read_to_string(ptx_path)?;
-    
-    Ok(CudaPtx::from_src(&ptx_string))
+    Ok(Ptx::from_src(PTX_SRC))
 }
 
+#[allow(dead_code)]
 pub fn hash_gpu_or_cpu(salt: &[u8], rom: &Rom, nb_loops: u32, nb_instrs: u32) -> [u8; 64] {
     match CudaAshmaize::new() {
         Ok(cuda) => match cuda.hash_parallel(&[salt], rom, nb_loops, nb_instrs) {
@@ -153,6 +188,7 @@ pub fn hash_gpu_or_cpu(salt: &[u8], rom: &Rom, nb_loops: u32, nb_instrs: u32) ->
     }
 }
 
+#[allow(dead_code)]
 pub fn hash_gpu(salt: &[u8], rom: &Rom, nb_loops: u32, nb_instrs: u32) -> GpuResult<[u8; 64]> {
     let cuda = CudaAshmaize::new()?;
     let results = cuda.hash_parallel(&[salt], rom, nb_loops, nb_instrs)?;
@@ -162,7 +198,7 @@ pub fn hash_gpu(salt: &[u8], rom: &Rom, nb_loops: u32, nb_instrs: u32) -> GpuRes
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ashmaize::RomGenerationType;
+    use ashmaize::rom::RomGenerationType;
 
     #[test]
     fn test_gpu_hash_basic() {

@@ -1,7 +1,6 @@
 use crate::gpu::{CudaAshmaize, GpuResult};
-use crate::{hash_structure_good, init_rom, MB};
+use crate::{hash_structure_good, init_rom};
 use ashmaize::b2::hash as cpu_hash;
-use ashmaize::Rom;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -187,7 +186,17 @@ pub fn run_single_hash_test(
     nonce: u64,
 ) -> GpuResult<()> {
     let rom = init_rom(no_pre_mine);
-    let cuda = CudaAshmaize::new()?;
+    
+    // Try to initialize CUDA, but don't fail if it's not available
+    let cuda_result = CudaAshmaize::new();
+    let cuda = match cuda_result {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("Warning: Could not initialize CUDA: {:?}", e);
+            eprintln!("Running CPU-only test...");
+            None
+        }
+    };
 
     let suffix = format!(
         "{}{}{}{}{}{}",
@@ -201,16 +210,27 @@ pub fn run_single_hash_test(
     let cpu_result = cpu_hash(preimage.as_bytes(), &rom, 8, 256);
     println!("CPU result: {}", hex::encode(&cpu_result[..8]));
 
-    let gpu_results = cuda.hash_parallel(&[preimage.as_bytes()], &rom, 8, 256)?;
-    let gpu_result = &gpu_results[0];
-    println!("GPU result: {}", hex::encode(&gpu_result[..8]));
+    if let Some(cuda) = cuda {
+        match cuda.hash_parallel(&[preimage.as_bytes()], &rom, 8, 256) {
+            Ok(gpu_results) => {
+                let gpu_result = &gpu_results[0];
+                println!("GPU result: {}", hex::encode(&gpu_result[..8]));
 
-    if cpu_result == *gpu_result {
-        println!("✓ Results match!");
+                if cpu_result == *gpu_result {
+                    println!("✓ Results match!");
+                } else {
+                    println!("✗ Results DO NOT match!");
+                    println!("Full CPU result: {}", hex::encode(&cpu_result));
+                    println!("Full GPU result: {}", hex::encode(gpu_result));
+                }
+            }
+            Err(e) => {
+                eprintln!("Error computing GPU hash: {:?}", e);
+                eprintln!("CPU result only: {}", hex::encode(&cpu_result[..8]));
+            }
+        }
     } else {
-        println!("✗ Results DO NOT match!");
-        println!("Full CPU result: {}", hex::encode(&cpu_result));
-        println!("Full GPU result: {}", hex::encode(gpu_result));
+        println!("GPU not available - showing CPU result only");
     }
 
     Ok(())

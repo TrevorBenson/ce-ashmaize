@@ -1,0 +1,49 @@
+# Containerfile with CUDA support for GPU-accelerated Ashmaize solver (Ubuntu-based)
+# Use NVIDIA CUDA base image with Ubuntu 24.04
+# Note: Using CUDA 12.6 as cudarc 0.12.x doesn't support CUDA 13.x yet
+FROM docker.io/nvidia/cuda:12.9.1-devel-ubuntu24.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Rust and build tools
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    jq \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install uv for Python
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+# Copy local repository (with CUDA 13.0 changes)
+# NOTE: Run from repository root: cd /home/illuminatus/Projects/ce-ashmaize && podman build -f cli_hunt/Containerfile.cuda-ubuntu -t ashmaize-solver:cuda12-ubuntu24 .
+WORKDIR /app/ce-ashmaize
+COPY . .
+
+# Build Rust solver WITH CUDA support
+RUN cd cli_hunt/rust_solver \
+    && cargo build --release --features cuda
+
+# Setup Python orchestrator
+RUN cd cli_hunt/python_orchestrator \
+    && uv sync
+
+# Set working directory
+WORKDIR /app/ce-ashmaize/cli_hunt
+
+# Add CUDA to PATH (should already be set in base image, but ensure it)
+ENV PATH="/usr/local/cuda/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+
+# Default command - run solver help to verify build
+CMD ["bash"]
