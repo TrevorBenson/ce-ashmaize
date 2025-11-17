@@ -104,36 +104,3 @@ fn find_cuda_path() -> Option<String> {
 
     None
 }
-
-
-
-    let output = Command::new("which").arg("nvcc").output();
-    if let Ok(output) = output {
-        if output.status.success() {
-            let nvcc_path = String::from_utf8_lossy(&output.stdout);
-            let nvcc_path = nvcc_path.trim();
-            if let Some(cuda_bin) = nvcc_path.strip_suffix("/bin/nvcc") {
-                return Some(cuda_bin.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-
-
-    let output = Command::new("which").arg("nvcc").output();
-    if let Ok(output) = output {
-        if output.status.success() {
-            let nvcc_path = String::from_utf8_lossy(&output.stdout);
-            let nvcc_path = nvcc_path.trim();
-            if let Some(cuda_bin) = nvcc_path.strip_suffix("/bin/nvcc") {
-                return Some(cuda_bin.to_string());
-            }
-        }
-    }
-
-    None
-}
-
