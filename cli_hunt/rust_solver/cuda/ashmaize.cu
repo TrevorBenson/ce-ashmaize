@@ -1,13 +1,22 @@
 #include "ashmaize_vm.cuh"
 
 __device__ void execute_one_instruction(VMState &vm, const uint8_t *rom,
-                                       const uint8_t *prog_chunk, uint32_t rom_size) {
+                                       const uint8_t *prog_chunk, uint32_t rom_size, bool debug = false) {
     Instruction instr = decode_instruction(prog_chunk);
+    
+    if (debug) {
+        printf("[GPU Instr 37] Decoded: opcode=%u, op1=%u, op2=%u, r1=%u, r2=%u, r3=%u\n",
+            instr.opcode, instr.op1, instr.op2, instr.r1, instr.r2, instr.r3);
+        printf("               lit1=0x%016llx, lit2=0x%016llx\n",
+            (unsigned long long)instr.lit1, (unsigned long long)instr.lit2);
+        printf("               Before: regs[%u]=0x%016llx\n",
+            instr.r3, (unsigned long long)vm.regs[instr.r3]);
+    }
 
     uint64_t src1, src2;
 
-            // Debug disabled to prevent massive output
-            bool debug_mem = false;
+    // Debug flag for operand evaluation
+    bool debug_mem = debug;
     
     // Always evaluate src1
     if (instr.op1 < 5) {
@@ -57,7 +66,12 @@ __device__ void execute_one_instruction(VMState &vm, const uint8_t *rom,
         printf("[GPU] Computed src1=0x%016llx, src2=0x%016llx\n",
             (unsigned long long)src1, (unsigned long long)src2);
     }
-
+    
+    if (debug) {
+        printf("               src1=0x%016llx, src2=0x%016llx\n",
+            (unsigned long long)src1, (unsigned long long)src2);
+    }
+    
     uint64_t result;
 
     if (instr.opcode < 40) {
@@ -81,7 +95,18 @@ __device__ void execute_one_instruction(VMState &vm, const uint8_t *rom,
     } else if (instr.opcode < 112) {
         result = (src2 != 0) ? src1 / src2 : special1_value64(vm.prog_digest_state);
     } else if (instr.opcode < 128) {
-        result = (src2 != 0) ? src1 % src2 : special1_value64(vm.prog_digest_state);
+        // BUG #14: CPU's Modulo operation actually does DIVISION (src1 / src2)
+        // This is a copy-paste bug in the CPU, but we must match it!
+        if (debug) {
+            printf("               Modulo (BUG: actually Division): src2 != 0? %s\n", src2 != 0 ? "true" : "false");
+        }
+        result = (src2 != 0) ? src1 / src2 : special1_value64(vm.prog_digest_state);
+        if (debug && src2 == 0) {
+            printf("               Using special1_value64=0x%016llx\n", (unsigned long long)result);
+        } else if (debug) {
+            printf("               Division result (CPU bug): 0x%016llx / 0x%016llx = 0x%016llx\n",
+                (unsigned long long)src1, (unsigned long long)src2, (unsigned long long)result);
+        }
     } else if (instr.opcode < 138) {
         result = isqrt_64(src1);
     } else if (instr.opcode < 148) {
@@ -155,6 +180,12 @@ __device__ void execute_one_instruction(VMState &vm, const uint8_t *rom,
     }
 
     vm.regs[instr.r3] = result;
+    
+    if (debug) {
+        printf("               After: regs[%u]=0x%016llx\n",
+            instr.r3, (unsigned long long)vm.regs[instr.r3]);
+    }
+    
     vm.ip = vm.ip + 1;
     
     // Update prog_digest with the instruction chunk (20 bytes)
@@ -193,43 +224,14 @@ extern "C" __global__ void ashmaize_hash_kernel(
         hprime(program, program_size, vm.prog_seed, 64);
 
         for (uint32_t instr_idx = 0; instr_idx < nb_instrs; ++instr_idx) {
-    // Debug disabled - Bug #11 fixed!
-    // if (tid == 0 && loop == 0 && instr_idx < 10) { ... }
-            
             // Use instr_idx because program gets reshuffled each loop (hprime above)
-            execute_one_instruction(vm, rom_data, program + instr_idx * INSTR_SIZE, rom_size);
-            
-        // Debug disabled - Bug #11 fixed!
-        // if (tid == 0 && loop == 0 && instr_idx < 10) { ... }
+            execute_one_instruction(vm, rom_data, program + instr_idx * INSTR_SIZE, rom_size, false);
         }
 
         post_instructions(vm);
         
-        // Debug: Print per-loop memory access count and prog_seed
-        if (tid == 0) {
-            uint32_t this_loop_count = vm.memory_counter - loop_mem_prev;
-            printf("GPU Loop %u: %u memory accesses (total: %u)\n", 
-                loop, this_loop_count, vm.memory_counter);
-            
-            if (loop == 0) {
-                printf("  prog_seed after loop 0: ");
-                for (int i = 0; i < 64; i++) printf("%02x", vm.prog_seed[i]);
-                printf("\n");
-            }
-            
-            loop_mem_prev = vm.memory_counter;
-        }
-    }
-
-    // Debug output for first thread only
-    if (tid == 0) {
-        printf("GPU Before finalize:\n");
-        printf("  memory_counter: %u\n", vm.memory_counter);
-        printf("  loop_counter: %u\n", vm.loop_counter);
-        printf("  ip: %u\n", vm.ip);
-        printf("  regs[0]: 0x%016llx\n", (unsigned long long)vm.regs[0]);
-        printf("  regs[1]: 0x%016llx\n", (unsigned long long)vm.regs[1]);
-        printf("  regs[31]: 0x%016llx\n", (unsigned long long)vm.regs[31]);
+        // Debug disabled - Bug #14 fixed!
+        loop_mem_prev = vm.memory_counter;
     }
 
     Blake2bState final_prog_state = vm.prog_digest_state;

@@ -217,10 +217,7 @@ __device__ void post_instructions(VMState &vm) {
         sum = sum + vm.regs[i];
     }
     
-    // Debug: Print sum after loop 0
-    if (vm.loop_counter == 0 && blockIdx.x * blockDim.x + threadIdx.x == 0) {
-        printf("[GPU post_instr loop 0] sum_regs=0x%016llx\n", (unsigned long long)sum);
-    }
+    // Debug disabled - Bug #14 fixed!
 
     uint8_t sum_bytes[8];
     sum_bytes[0] = (uint8_t)(sum >> 0);
