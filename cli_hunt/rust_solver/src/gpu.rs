@@ -50,6 +50,7 @@ pub type GpuResult<T> = Result<T, GpuError>;
 pub struct CudaAshmaize {
     device: Arc<CudaDevice>,
     kernel_func: CudaFunction,
+    kernel_shared_mem: Option<CudaFunction>,
 }
 
 impl CudaAshmaize {
@@ -62,13 +63,25 @@ impl CudaAshmaize {
 
         let ptx = compile_kernel()?;
         device.load_ptx(ptx.clone(), "ashmaize", &["ashmaize_hash_kernel"])?;
-        
-        let kernel_func = device.get_func("ashmaize", "ashmaize_hash_kernel")
+
+        let kernel_func = device
+            .get_func("ashmaize", "ashmaize_hash_kernel")
             .ok_or("Failed to get kernel function")?;
+
+        // TODO: Re-enable shared memory kernel when fixed
+        let kernel_shared_mem = None;
+        // let kernel_shared_mem = match compile_kernel_shared_mem() {
+        //     Ok(ptx_shared) => {
+        //         device.load_ptx(ptx_shared, "ashmaize_shared", &["ashmaize_hash_kernel_shared_mem"]).ok();
+        //         device.get_func("ashmaize_shared", "ashmaize_hash_kernel_shared_mem")
+        //     }
+        //     Err(_) => None
+        // };
 
         Ok(Self {
             device,
             kernel_func,
+            kernel_shared_mem,
         })
     }
 
@@ -83,12 +96,48 @@ impl CudaAshmaize {
         nb_loops: u32,
         nb_instrs: u32,
     ) -> GpuResult<Vec<[u8; 64]>> {
+        self.hash_parallel_with_block_size(salts, rom, nb_loops, nb_instrs, 256)
+    }
+
+    pub fn hash_parallel_with_block_size(
+        &self,
+        salts: &[&[u8]],
+        rom: &Rom,
+        nb_loops: u32,
+        nb_instrs: u32,
+        threads_per_block: u32,
+    ) -> GpuResult<Vec<[u8; 64]>> {
+        self.hash_parallel_with_kernel(salts, rom, nb_loops, nb_instrs, threads_per_block, false)
+    }
+
+    pub fn hash_parallel_shared_mem(
+        &self,
+        salts: &[&[u8]],
+        rom: &Rom,
+        nb_loops: u32,
+        nb_instrs: u32,
+    ) -> GpuResult<Vec<[u8; 64]>> {
+        if self.kernel_shared_mem.is_none() {
+            return Err("Shared memory kernel not loaded".into());
+        }
+        self.hash_parallel_with_kernel(salts, rom, nb_loops, nb_instrs, 256, true)
+    }
+
+    fn hash_parallel_with_kernel(
+        &self,
+        salts: &[&[u8]],
+        rom: &Rom,
+        nb_loops: u32,
+        nb_instrs: u32,
+        threads_per_block: u32,
+        use_shared_mem: bool,
+    ) -> GpuResult<Vec<[u8; 64]>> {
         let num_hashes = salts.len();
         let program_size = nb_instrs as usize * 20;
 
         // Find max salt length
         let max_salt_len = salts.iter().map(|s| s.len()).max().unwrap_or(0);
-        
+
         // Pack salts with proper length (no truncation)
         let mut all_salts = Vec::new();
         for salt in salts {
@@ -120,17 +169,24 @@ impl CudaAshmaize {
 
         let salt_len = max_salt_len as u32;
 
-        let threads_per_block = 256;
         let num_blocks = (num_hashes as u32 + threads_per_block - 1) / threads_per_block;
+
+        let shared_mem_bytes = if use_shared_mem { 16384 } else { 0 };
 
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
             block_dim: (threads_per_block, 1, 1),
-            shared_mem_bytes: 0,
+            shared_mem_bytes,
+        };
+
+        let kernel = if use_shared_mem {
+            self.kernel_shared_mem.as_ref().unwrap().clone()
+        } else {
+            self.kernel_func.clone()
         };
 
         unsafe {
-            self.kernel_func.clone().launch(
+            kernel.launch(
                 cfg,
                 (
                     &rom_buffer,
@@ -150,7 +206,7 @@ impl CudaAshmaize {
         }
 
         let results_host = self.device.dtoh_sync_copy(&results_buffer)?;
-        
+
         let mut results = Vec::new();
         for i in 0..num_hashes {
             let mut result = [0u8; 64];
@@ -162,10 +218,7 @@ impl CudaAshmaize {
     }
 
     pub fn get_device_info(&self) -> GpuResult<String> {
-        Ok(format!(
-            "CUDA Device: {}",
-            self.device.name()?,
-        ))
+        Ok(format!("CUDA Device: {}", self.device.name()?,))
     }
 }
 
@@ -173,9 +226,15 @@ fn compile_kernel() -> GpuResult<Ptx> {
     // Load PTX that was compiled during build time by build.rs
     // The PTX is embedded in the binary as a static string
     const PTX_SRC: &str = include_str!(concat!(env!("OUT_DIR"), "/ashmaize.ptx"));
-    
+
     Ok(Ptx::from_src(PTX_SRC))
 }
+
+// TODO: Re-enable when shared_mem kernel is fixed
+// fn compile_kernel_shared_mem() -> GpuResult<Ptx> {
+//     const PTX_SRC: &str = include_str!(concat!(env!("OUT_DIR"), "/ashmaize_shared_mem.ptx"));
+//     Ok(Ptx::from_src(PTX_SRC))
+// }
 
 #[allow(dead_code)]
 pub fn hash_gpu_or_cpu(salt: &[u8], rom: &Rom, nb_loops: u32, nb_instrs: u32) -> [u8; 64] {
@@ -249,10 +308,9 @@ mod tests {
 
         let salt = b"comparison_test";
         let cpu_result = ashmaize::b2::hash(salt, &rom, 8, 256);
-        
+
         if let Ok(gpu_result) = hash_gpu(salt, &rom, 8, 256) {
             assert_eq!(cpu_result, gpu_result);
         }
     }
 }
-

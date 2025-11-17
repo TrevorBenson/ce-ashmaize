@@ -1,5 +1,8 @@
 #include "ashmaize_vm.cuh"
 
+// Phase 6 Optimization Tests
+// Test 2: Loop unrolling - reduce loop overhead
+
 __device__ void execute_one_instruction(VMState &vm, const uint8_t *rom,
                                        const uint8_t *prog_chunk, uint32_t rom_size, bool debug = false) {
     Instruction instr = decode_instruction(prog_chunk);
@@ -223,6 +226,8 @@ extern "C" __global__ void ashmaize_hash_kernel(
     for (uint32_t loop = 0; loop < nb_loops; ++loop) {
         hprime(program, program_size, vm.prog_seed, 64);
 
+        // Phase 6 Optimization: unroll 16 optimal (+2.0% vs baseline)
+        #pragma unroll 16
         for (uint32_t instr_idx = 0; instr_idx < nb_instrs; ++instr_idx) {
             // Use instr_idx because program gets reshuffled each loop (hprime above)
             execute_one_instruction(vm, rom_data, program + instr_idx * INSTR_SIZE, rom_size, false);

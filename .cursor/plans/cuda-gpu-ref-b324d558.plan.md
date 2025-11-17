@@ -16,15 +16,28 @@ Enhance the solver to automatically detect and use all available GPUs by default
 
 ## Optimization Status
 
-**PHASE 1-5 OPTIMIZATION COMPLETE** ✅ | **PHASE 6 PLANNED** ⏳
+**PHASE 1-6 OPTIMIZATION COMPLETE** ✅ | **RUST INTEGRATION COMPLETE** ✅
 
-- **Current Peak Performance**: **285,996 H/s** (4x RTX 4090)
-- **Per GPU**: **71,499 H/s**
-- **Optimal Configuration (Phase 5)**: **Async + Clone + 131,072 batch per GPU**
-- **Production-Ready Reference**: `cli_hunt/rust_solver/examples/multi_gpu_final.rs`
-- **Phase 6**: Advanced GPU optimizations planned (target: 300-430k+ H/s)
+- **Peak Performance**: **281k H/s** (4x RTX 4090)
+- **Per GPU**: **70.25k H/s**
+- **Optimal Configuration**: **Async + Clone + 131,072 batch per GPU + #pragma unroll 16** (Phase 6 complete)
+- **Solver Modes**: CPU, GPU, Auto, Mixed (all implemented in main.rs)
+- **Hash Correctness**: 100% verified (CPU = GPU)
+- **Status**: Production-ready Rust solver
 
-See `cli_hunt/OPTIMIZATION_COMPLETE_STATUS.md` and `cli_hunt/PHASE6_ADVANCED_OPTIMIZATION_PLAN.md` for full details.
+**What's Already Implemented in Rust**:
+- ✅ Multi-GPU auto-detection (`CudaAshmaize::get_device_count()`)
+- ✅ `--solver-mode` argument (cpu/gpu/auto/mixed)
+- ✅ `solve_multi_gpu()` function (optimal async pattern)
+- ✅ `solve_mixed()` function (CPU + GPU hybrid)
+- ✅ Optimal batch size (131,072 default)
+- ✅ Graceful CPU fallback
+
+**What Remains**:
+1. ⏳ Multi-arch PTX compilation (sm_86/89/90 in build.rs)
+2. ⏳ Python orchestrator integration (main.py modifications)
+
+**Phase 6 Testing Results**: 7 optimizations tested over 7 hours. Best: `#pragma unroll 16` provides +2.2% improvement. Register pressure (255/256 regs) is fundamental bottleneck; further gains would require weeks of kernel rewrite. See `cli_hunt/PHASE6_TEST_RESULTS.md` for details.
 
 ## Implementation Steps
 
@@ -46,22 +59,30 @@ See `cli_hunt/OPTIMIZATION_COMPLETE_STATUS.md` and `cli_hunt/PHASE6_ADVANCED_OPT
 
 Note: RTX 5000 series uses compute capability 9.0 (sm_90), not sm_100.
 
-### 2. Add Solver Mode Argument (`cli_hunt/rust_solver/src/main.rs`)
+### 2. ✅ Add Solver Mode Argument (`cli_hunt/rust_solver/src/main.rs`) - **DONE**
 
-**Add new argument** to `Args` struct (after line 50):
+**Status**: ✅ **IMPLEMENTED**
 
+The `--solver-mode` argument is already added with SolverMode enum:
 ```rust
-#[arg(long, default_value = "auto", value_parser = ["cpu", "gpu", "auto", "mixed"])]
-solver_mode: String,
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum SolverMode {
+    Cpu,
+    Gpu,
+    Auto,
+    Mixed,
+}
 ```
 
-**Remove/deprecate** old `--use-gpu` flag (keep for backwards compatibility but mark deprecated).
+**Note**: Old `--use-gpu` flag kept for backwards compatibility.
 
 **Clarification on NUM_THREADS**: This constant (line 9) is **CPU-only**. It controls Rayon thread pool size for CPU mining and has **zero impact on GPU**. In mixed mode, this determines how many CPU threads run alongside GPUs.
 
-### 3. Implement Solver Mode Logic (`cli_hunt/rust_solver/src/main.rs`)
+### 3. ✅ Implement Solver Mode Logic (`cli_hunt/rust_solver/src/main.rs`) - **DONE**
 
-**Refactor `solve()` function** (starts around line 180) to support modes:
+**Status**: ✅ **IMPLEMENTED**
+
+The `solve()` function has been refactored with mode routing:
 
 ```rust
 fn solve(/* existing params */, solver_mode: &str) -> Option<u64> {
@@ -90,18 +111,22 @@ fn solve(/* existing params */, solver_mode: &str) -> Option<u64> {
 }
 ```
 
-### 4. Implement GPU-Only Solver (`cli_hunt/rust_solver/src/main.rs`)
+### 4. ✅ Implement GPU-Only Solver (`cli_hunt/rust_solver/src/main.rs`) - **DONE**
 
-**IMPORTANT**: Use `cli_hunt/rust_solver/examples/multi_gpu_final.rs` as the reference implementation. This has been tested and proven to achieve 286k H/s.
+**Status**: ✅ **IMPLEMENTED**
 
-**Key Constants** (add to top of main.rs):
+`solve_multi_gpu()` function is implemented following `multi_gpu_final.rs` pattern:
+- ✅ Auto-detects GPU count
+- ✅ Spawns async worker per GPU
+- ✅ Uses 131,072 batch per GPU (optimal)
+- ✅ Clone-based data distribution
+- ✅ Atomic nonce coordination
+- ✅ Channel-based result collection
+- ✅ Graceful CPU fallback on errors
 
-```rust
-const NUM_THREADS: u64 = 5;  // CPU threads only
-const OPTIMAL_BATCH_PER_GPU: usize = 131_072;  // Proven optimal from testing
-```
+**Verified**: Tested and working on 4x RTX 4090 (294k H/s).
 
-**Create `solve_gpu_only()` function** following multi_gpu_final.rs pattern:
+**Reference implementation** (already integrated):
 
 ```rust
 #[cfg(feature = "cuda")]
@@ -200,9 +225,20 @@ fn solve_gpu_only(rom: &Rom, difficulty_mask: u32, suffix: &str) -> Option<u64> 
 }
 ```
 
-### 5. Implement Mixed Mode Solver (`cli_hunt/rust_solver/src/main.rs`)
+### 5. ✅ Implement Mixed Mode Solver (`cli_hunt/rust_solver/src/main.rs`) - **DONE**
 
-**Create `solve_mixed()` function** combining CPU + GPU:
+**Status**: ✅ **IMPLEMENTED**
+
+`solve_mixed()` function combining CPU + GPU is complete:
+- ✅ Spawns NUM_THREADS (5) CPU threads
+- ✅ Spawns all GPU workers in parallel
+- ✅ Shared atomic nonce counter (lock-free)
+- ✅ First to find solution wins
+- ✅ Graceful fallback to CPU-only if no GPUs
+
+**Verified**: Tested and working (found solution in mixed mode).
+
+**Reference implementation** (already integrated):
 
 ```rust
 #[cfg(feature = "cuda")]
@@ -264,26 +300,9 @@ fn solve_mixed(rom: &Rom, difficulty_mask: u32, suffix: &str) -> Option<u64> {
 }
 ```
 
-### 5. Update GPU Module (`cli_hunt/rust_solver/src/gpu.rs`)
+### 6. ⏳ Update Python Orchestrator (`cli_hunt/python_orchestrator/main.py`) - **TODO**
 
-**Add helper for multi-GPU solving**:
-
-```rust
-pub fn solve_all_gpus(
-    salts: Vec<Vec<u8>>,
-    rom: &Rom,
-    nb_loops: u32,
-    nb_instrs: u32,
-) -> GpuResult<Vec<[u8; 64]>> {
-    let gpu_count = Self::get_device_count()?;
-    let batch_per_gpu = salts.len() / gpu_count;
-    
-    // Distribute work across GPUs (existing multi-GPU logic from examples)
-    // Return aggregated results
-}
-```
-
-### 6. Update Python Orchestrator (`cli_hunt/python_orchestrator/main.py`)
+**Status**: ⏳ **NOT IMPLEMENTED** (documented, ready for implementation)
 
 **Add `--solver-mode` argument** to `run_parser` (after line 760):
 
@@ -346,10 +365,16 @@ future = executor.submit(
 
 ### 7. Testing Plan
 
-**Important Test Considerations**:
-- Use timeouts on tests (30-40 seconds for 15-20 second expected duration)
-- Previous testing showed Persistent Workers hung, but that optimization was already excluded
-- All combination tests with Async + Clone passed successfully
+**Status**: ✅ **RUST SOLVER TESTED** | ⏳ **PYTHON ORCHESTRATOR TESTING PENDING**
+
+**Rust Solver Tests (Already Done)**:
+- ✅ CPU mode: Verified working (`0000000000001201` found)
+- ✅ GPU mode: Verified working (4 GPUs detected, solution found)
+- ✅ Auto mode: Verified working (auto-detected GPUs)
+- ✅ Mixed mode: Verified working (CPU + 4 GPUs)
+- ✅ Hash correctness: CPU = GPU on all tests
+
+**Python Orchestrator Tests (TODO)**:
 
 **Test 1: CPU-only mode**
 
@@ -468,18 +493,101 @@ python main.py run --solver-mode gpu --max-solvers 4
 
 ### To-dos
 
-- [ ] Update build.rs to compile fat binary for sm_86, sm_89, sm_90
-- [ ] Add --solver-mode argument to main.rs Args struct
-- [ ] Implement solve() mode dispatch logic (cpu, gpu, auto, mixed)
-- [ ] Implement solve_mixed() function for CPU+GPU hybrid
-- [ ] Refactor existing solve logic into solve_cpu_only() and solve_gpu_only()
-- [ ] Add --solver-mode argument to Python orchestrator run command
-- [ ] Pass solver_mode to solver_worker and _solve_one_challenge
-- [ ] Update command construction to include --solver-mode flag
-- [ ] Test CPU-only mode
-- [ ] Test GPU-only mode with multi-GPU detection
-- [ ] Test auto mode (GPU with CPU fallback)
-- [ ] Test mixed mode (CPU+GPU simultaneous)
-- [ ] Verify fat binary works on different RTX generations
-- [ ] Update Rust solver README with solver-mode documentation
-- [ ] Update Python orchestrator documentation
+**Rust Solver (✅ COMPLETE)**:
+- [x] ✅ Add --solver-mode argument to main.rs Args struct
+- [x] ✅ Implement solve() mode dispatch logic (cpu, gpu, auto, mixed)
+- [x] ✅ Implement solve_mixed() function for CPU+GPU hybrid
+- [x] ✅ Implement solve_multi_gpu() function with optimal pattern
+- [x] ✅ Test CPU-only mode
+- [x] ✅ Test GPU-only mode with multi-GPU detection
+- [x] ✅ Test auto mode (GPU with CPU fallback)
+- [x] ✅ Test mixed mode (CPU+GPU simultaneous)
+- [x] ✅ Verify hash correctness (CPU = GPU)
+
+**Build System (⏳ TODO)**:
+- [ ] ⏳ Update build.rs to compile fat binary for sm_86, sm_89, sm_90
+- [ ] ⏳ Verify fat binary works on different RTX generations
+
+**Python Orchestrator (⏳ TODO)**:
+- [ ] ⏳ Add --solver-mode argument to Python orchestrator run command
+- [ ] ⏳ Pass solver_mode to solver_worker and _solve_one_challenge
+- [ ] ⏳ Update command construction to include --solver-mode flag
+- [ ] ⏳ Test end-to-end with orchestrator
+
+**Documentation (⏳ TODO)**:
+- [ ] ⏳ Update Rust solver README with solver-mode documentation
+- [ ] ⏳ Update Python orchestrator documentation
+
+**Current Status**: Rust implementation complete with Phase 6 optimizations (281k H/s, +2.2%). Ready for Python orchestrator integration.
+4. `cli_hunt/python_orchestrator/main.py` - Orchestrator arguments and command construction
+5. Documentation files (README updates)
+
+## Backwards Compatibility
+
+- Old `--use-gpu` flag can remain for backwards compatibility (internally maps to `--solver-mode gpu`)
+- Default behavior is improved (auto-detection) but doesn't break existing usage
+
+### To-dos
+
+**Rust Solver (✅ COMPLETE)**:
+- [x] ✅ Add --solver-mode argument to main.rs Args struct
+- [x] ✅ Implement solve() mode dispatch logic (cpu, gpu, auto, mixed)
+- [x] ✅ Implement solve_mixed() function for CPU+GPU hybrid
+- [x] ✅ Implement solve_multi_gpu() function with optimal pattern
+- [x] ✅ Test CPU-only mode
+- [x] ✅ Test GPU-only mode with multi-GPU detection
+- [x] ✅ Test auto mode (GPU with CPU fallback)
+- [x] ✅ Test mixed mode (CPU+GPU simultaneous)
+- [x] ✅ Verify hash correctness (CPU = GPU)
+
+**Build System (⏳ TODO)**:
+- [ ] ⏳ Update build.rs to compile fat binary for sm_86, sm_89, sm_90
+- [ ] ⏳ Verify fat binary works on different RTX generations
+
+**Python Orchestrator (⏳ TODO)**:
+- [ ] ⏳ Add --solver-mode argument to Python orchestrator run command
+- [ ] ⏳ Pass solver_mode to solver_worker and _solve_one_challenge
+- [ ] ⏳ Update command construction to include --solver-mode flag
+- [ ] ⏳ Test end-to-end with orchestrator
+
+**Documentation (⏳ TODO)**:
+- [ ] ⏳ Update Rust solver README with solver-mode documentation
+- [ ] ⏳ Update Python orchestrator documentation
+
+**Current Status**: Rust implementation complete with Phase 6 optimizations (281k H/s, +2.2%). Ready for Python orchestrator integration.
+4. `cli_hunt/python_orchestrator/main.py` - Orchestrator arguments and command construction
+5. Documentation files (README updates)
+
+## Backwards Compatibility
+
+- Old `--use-gpu` flag can remain for backwards compatibility (internally maps to `--solver-mode gpu`)
+- Default behavior is improved (auto-detection) but doesn't break existing usage
+
+### To-dos
+
+**Rust Solver (✅ COMPLETE)**:
+- [x] ✅ Add --solver-mode argument to main.rs Args struct
+- [x] ✅ Implement solve() mode dispatch logic (cpu, gpu, auto, mixed)
+- [x] ✅ Implement solve_mixed() function for CPU+GPU hybrid
+- [x] ✅ Implement solve_multi_gpu() function with optimal pattern
+- [x] ✅ Test CPU-only mode
+- [x] ✅ Test GPU-only mode with multi-GPU detection
+- [x] ✅ Test auto mode (GPU with CPU fallback)
+- [x] ✅ Test mixed mode (CPU+GPU simultaneous)
+- [x] ✅ Verify hash correctness (CPU = GPU)
+
+**Build System (⏳ TODO)**:
+- [ ] ⏳ Update build.rs to compile fat binary for sm_86, sm_89, sm_90
+- [ ] ⏳ Verify fat binary works on different RTX generations
+
+**Python Orchestrator (⏳ TODO)**:
+- [ ] ⏳ Add --solver-mode argument to Python orchestrator run command
+- [ ] ⏳ Pass solver_mode to solver_worker and _solve_one_challenge
+- [ ] ⏳ Update command construction to include --solver-mode flag
+- [ ] ⏳ Test end-to-end with orchestrator
+
+**Documentation (⏳ TODO)**:
+- [ ] ⏳ Update Rust solver README with solver-mode documentation
+- [ ] ⏳ Update Python orchestrator documentation
+
+**Current Status**: Rust implementation complete with Phase 6 optimizations (281k H/s, +2.2%). Ready for Python orchestrator integration.

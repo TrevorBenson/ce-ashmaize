@@ -301,7 +301,7 @@ def fetcher_worker(db_manager, stop_event, tui_app):
     logging.info("Fetcher thread stopped.")
 
 
-def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
+def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge, solver_mode):
     """Solves a single challenge."""
     c = challenge  # for brevity
     short_address = f"{address[:10]}…{address[-6:]}"
@@ -323,6 +323,8 @@ def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
             c["latestSubmission"],
             "--no-pre-mine-hour",
             str(c["noPreMineHour"]),  # Convert to string for subprocess
+            "--solver-mode",
+            solver_mode,
         ]
         start_time = datetime.now(timezone.utc)
         process = subprocess.Popen(
@@ -465,7 +467,7 @@ def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
 
 
 def solver_worker(
-    db_manager, stop_event, solve_interval, tui_app, max_solvers, challenge_selection
+    db_manager, stop_event, solve_interval, tui_app, max_solvers, challenge_selection, solver_mode
 ):
     tui_app.post_message(
         LogMessage(
@@ -546,6 +548,7 @@ def solver_worker(
                                 stop_event,
                                 address,
                                 deepcopy(c),  # Pass a deepcopy
+                                solver_mode,
                             )
                             active_futures.add(future)
                             challenges_dispatched_this_round += 1
@@ -704,6 +707,7 @@ def run_orchestrator(args):
         "stats_interval": args.stats_interval,
         "max_solvers": args.max_solvers,
         "challenge_selection": args.challenge_selection,
+        "solver_mode": args.solver_mode,
     }
 
     app = OrchestratorTUI(
@@ -757,6 +761,13 @@ def main():
         type=int,
         default=DEFAULT_STATS_INTERVAL,
         help=f"Interval in seconds for updating wallet mining statistics (default: {DEFAULT_STATS_INTERVAL}).",
+    )
+    run_parser.add_argument(
+        "--solver-mode",
+        type=str,
+        choices=["cpu", "gpu", "auto", "mixed"],
+        default="auto",
+        help="Solver mode: 'cpu' (CPU only), 'gpu' (GPU only), 'auto' (GPU if available, else CPU), 'mixed' (CPU + GPU together). Default: auto",
     )
 
     args = parser.parse_args()

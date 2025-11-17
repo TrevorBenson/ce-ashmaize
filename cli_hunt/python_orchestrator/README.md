@@ -1,0 +1,165 @@
+# Python Orchestrator
+
+Multi-wallet mining orchestrator for the Midnight Scavenger Hunt with a Terminal UI (TUI).
+
+## Overview
+
+The Python orchestrator manages mining operations across multiple wallets, automatically fetching challenges, solving them using the Rust solver, and submitting solutions. It provides a real-time terminal interface showing challenge status, mining statistics, and logs.
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.10+
+- `uv` package manager
+- Built Rust solver at `../rust_solver/target/release/ashmaize-solver`
+
+### Initial Setup
+
+1. Initialize the database with wallet JSON files:
+
+```bash
+uv run main.py init wallet1.json wallet2.json ...
+```
+
+2. Start the orchestrator:
+
+```bash
+uv run main.py run
+```
+
+## Usage
+
+### Initialize Database
+
+```bash
+uv run main.py init <json_files...>
+```
+
+Imports wallet registration data and challenge queues from JSON files. Creates or updates `challenges.json`.
+
+### Run Orchestrator
+
+```bash
+uv run main.py run [options]
+```
+
+#### Core Options
+
+- `--max-solvers <N>` - Number of concurrent solvers (default: 2)
+- `--challenge-selection {first,last}` - Challenge priority (default: first)
+- `--solver-mode {cpu,gpu,auto,mixed}` - Solver execution mode (default: auto)
+
+#### Timing Options
+
+- `--solve-interval <seconds>` - Check for new challenges every N seconds (default: 120)
+- `--save-interval <seconds>` - Save database to disk every N seconds (default: 600)
+- `--stats-interval <seconds>` - Update wallet statistics every N seconds (default: 3600)
+
+### Solver Modes
+
+The `--solver-mode` flag controls how mining is performed:
+
+- **`cpu`** - CPU-only mining (5 threads per solver)
+- **`gpu`** - GPU-only mining (uses all available GPUs)
+- **`auto`** (default) - Automatically use GPUs if available, fallback to CPU
+- **`mixed`** - Run CPU threads + all GPUs simultaneously in a single process
+
+#### Examples
+
+```bash
+# Default: Auto-detect and use GPUs
+uv run main.py run
+
+# CPU-only mining (useful for testing or mixed workloads)
+uv run main.py run --solver-mode cpu
+
+# GPU-only with 4 parallel solvers (max performance on multi-GPU systems)
+uv run main.py run --solver-mode gpu --max-solvers 4
+
+# Mixed mode: CPU + GPU together in single solver (maximize solutions)
+uv run main.py run --solver-mode mixed --max-solvers 1
+
+# Custom intervals: check for challenges every 30s, save every 5 minutes
+uv run main.py run --solve-interval 30 --save-interval 300
+```
+
+## Architecture
+
+### Components
+
+1. **Fetcher Worker** - Polls API every 10 minutes for new challenges
+2. **Solver Worker** - Manages parallel solver processes using ThreadPoolExecutor
+3. **Saver Worker** - Periodically writes database to disk
+4. **Stats Worker** - Updates wallet mining statistics from API
+
+### Data Files
+
+- `challenges.json` - Main database (addresses, challenges, statistics)
+- `challenges.json.journal` - Write-ahead log for crash recovery
+- `orchestrator.log` - Detailed logging output
+
+### TUI Interface
+
+- **Top Panel** - Challenge table showing status for each wallet (✅ validated, ⚙️ solving, ⏳ available, ❌ expired)
+- **Bottom Left** - Live log viewer with timestamped events
+- **Bottom Right** - Wallet statistics (receipts, NIGHT tokens)
+- **Footer** - Keyboard shortcuts (Ctrl+C to quit)
+
+## Multi-GPU Performance
+
+The orchestrator works seamlessly with multi-GPU systems:
+
+- **GPU Mode**: Each solver process uses all GPUs (batch size: 131,072 per GPU)
+- **Optimal Setup**: 4x RTX 4090 achieves ~281k H/s (70k H/s per GPU)
+- **Auto-Detection**: Rust solver automatically detects and uses all available GPUs
+- **Compatibility**: Supports RTX 3000/4000/5000 series (sm_86/89/90)
+
+## Development
+
+### Running Tests
+
+```bash
+cd python_orchestrator
+uv run pytest tests/
+```
+
+### Code Coverage
+
+```bash
+uv run coverage run -m pytest tests/
+uv run coverage report
+```
+
+## Troubleshooting
+
+### "Database file not found"
+
+Run `uv run main.py init <json_files>` first to create the database.
+
+### "Rust solver error"
+
+Ensure the Rust solver is built:
+
+```bash
+cd ../rust_solver
+cargo build --release --features cuda
+```
+
+### GPU Not Detected
+
+- Verify CUDA installation: `nvidia-smi`
+- Check solver output for GPU detection messages
+- Try `--solver-mode gpu` to force GPU mode (will error if no GPUs available)
+
+## Performance Tips
+
+1. Use `--max-solvers 1` with `--solver-mode mixed` to maximize CPU+GPU usage
+2. For pure GPU mining on 4-GPU systems, use `--solver-mode gpu --max-solvers 4`
+3. Reduce `--solve-interval` to check for challenges more frequently
+4. Use `--challenge-selection last` to prioritize newest challenges
+
+## License
+
+Dual-licensed under Apache 2.0 and MIT.
+

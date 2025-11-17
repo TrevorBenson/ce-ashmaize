@@ -348,6 +348,7 @@ class OrchestratorTUI(App):
         solve_interval = self.worker_args["solve_interval"]
         max_solvers = self.worker_args["max_solvers"]
         challenge_selection = self.worker_args["challenge_selection"]
+        solver_mode = self.worker_args["solver_mode"]
         solver_func(
             self.db_manager,
             self.stop_event,
@@ -355,6 +356,7 @@ class OrchestratorTUI(App):
             self,
             max_solvers,
             challenge_selection,
+            solver_mode,
         )
 
     @work(name="saver", group="workers", thread=True)
