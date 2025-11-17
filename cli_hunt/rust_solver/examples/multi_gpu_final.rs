@@ -56,8 +56,8 @@ fn main() {
             1 * GB,
         ));
 
-        // Optimal batch size from tuning
-        let batch_per_gpu = 16384;
+        // Optimal batch size from tuning (131,072 achieves peak 267k H/s)
+        let batch_per_gpu = 131072;
         let total_batch_size = batch_per_gpu * gpu_count;
         let duration_secs = 30;
 
