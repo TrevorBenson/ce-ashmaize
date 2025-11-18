@@ -301,11 +301,11 @@ def fetcher_worker(db_manager, stop_event, tui_app):
     logging.info("Fetcher thread stopped.")
 
 
-def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
+def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge, solver_mode):
     """Solves a single challenge."""
     c = challenge  # for brevity
     short_address = f"{address[:10]}…{address[-6:]}"
-    msg = f"Attempting to solve challenge {c['challengeId']} for {short_address}"
+    msg = f"Attempting to solve challenge {c['challengeId']} for {short_address} (mode: {solver_mode})"
     tui_app.post_message(LogMessage(msg))
 
     try:
@@ -318,11 +318,13 @@ def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
             "--difficulty",
             c["difficulty"],
             "--no-pre-mine",
-            str(c["noPreMine"]),  # Convert boolean to string for subprocess
+            str(c["noPreMine"]),
             "--latest-submission",
             c["latestSubmission"],
             "--no-pre-mine-hour",
-            str(c["noPreMineHour"]),  # Convert to string for subprocess
+            str(c["noPreMineHour"]),
+            "--solver-mode",
+            solver_mode,
         ]
         start_time = datetime.now(timezone.utc)
         process = subprocess.Popen(
@@ -356,10 +358,21 @@ def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
             )
 
         nonce = stdout.strip()
-        num_hashes = int(nonce, 16)
+        nonce_value = int(nonce, 16)
         solved_time = datetime.now(timezone.utc)
         solve_duration = (solved_time - start_time).total_seconds()
-        hash_rate = num_hashes / solve_duration if solve_duration > 0 else 0
+
+        if solver_mode == "cpu":
+            hash_rate = nonce_value / solve_duration if solve_duration > 0 else 0
+            hashrate_msg = f"⚡ Hashrate: {hash_rate:.2f} H/s"
+        else:
+            batch_size_per_gpu = 131072
+            gpu_count = 4
+            total_batch_size = batch_size_per_gpu * gpu_count
+            batch_round = (nonce_value // total_batch_size) + 1
+            estimated_hashes = batch_round * total_batch_size
+            estimated_hashrate = estimated_hashes / solve_duration if solve_duration > 0 else 0
+            hashrate_msg = f"⚡ Estimated hashrate: {estimated_hashrate:.2f} H/s (~{batch_round} batch rounds)"
 
         tui_app.post_message(
             LogMessage("-----------------------------------------------")
@@ -368,7 +381,7 @@ def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
             LogMessage(f"🔢 Found nonce: {nonce} for {c['challengeId']}")
         )
         tui_app.post_message(LogMessage(f"⏱️ Solved in {solve_duration:.2f} seconds"))
-        tui_app.post_message(LogMessage(f"⚡ Hashrate: {hash_rate:.2f} H/s"))
+        tui_app.post_message(LogMessage(hashrate_msg))
 
         submit_url = f"https://scavenger.prod.gd.midnighttge.io/solution/{address}/{c['challengeId']}/{nonce}"
         submit_response = session.post(submit_url)
@@ -465,7 +478,7 @@ def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
 
 
 def solver_worker(
-    db_manager, stop_event, solve_interval, tui_app, max_solvers, challenge_selection
+    db_manager, stop_event, solve_interval, tui_app, max_solvers, challenge_selection, solver_mode
 ):
     tui_app.post_message(
         LogMessage(
@@ -546,6 +559,7 @@ def solver_worker(
                                 stop_event,
                                 address,
                                 deepcopy(c),  # Pass a deepcopy
+                                solver_mode,
                             )
                             active_futures.add(future)
                             challenges_dispatched_this_round += 1
@@ -704,6 +718,7 @@ def run_orchestrator(args):
         "stats_interval": args.stats_interval,
         "max_solvers": args.max_solvers,
         "challenge_selection": args.challenge_selection,
+        "solver_mode": args.solver_mode,
     }
 
     app = OrchestratorTUI(
@@ -757,6 +772,13 @@ def main():
         type=int,
         default=DEFAULT_STATS_INTERVAL,
         help=f"Interval in seconds for updating wallet mining statistics (default: {DEFAULT_STATS_INTERVAL}).",
+    )
+    run_parser.add_argument(
+        "--solver-mode",
+        type=str,
+        choices=["cpu", "gpu", "auto", "mixed"],
+        default="auto",
+        help="Solver mode: 'cpu' (CPU only), 'gpu' (GPU only), 'auto' (GPU if available, else CPU), 'mixed' (CPU + GPU together). Default: auto",
     )
 
     args = parser.parse_args()
